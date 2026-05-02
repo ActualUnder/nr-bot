@@ -2,9 +2,9 @@
 
 # Metro T3 Learner Discord Bot
 
-This is a simple Discord slash-command controlled bot wrapped around `t3_learner_clean.py`.
+This is a Discord slash-command controlled bot wrapped around `t3_learner_clean.py` for the T3 Network Rail TD/S-Class learner.
 
-It is meant as a base model for learning, signal bit inspection, stats, downloads/uploads and live Network Rail TD feed status.
+It is designed for live learning, signal/bit inspection, route-bit discovery, stats, upload/download, and live Network Rail TD feed status while keeping runtime data outside the Git repository.
 
 ## Main idea
 
@@ -14,25 +14,59 @@ It is meant as a base model for learning, signal bit inspection, stats, download
 - systemd starts the bot automatically.
 - the startup script pulls latest GitHub code on every restart.
 - runtime data is not stored in the repo, so `git reset --hard` cannot wipe it.
-- SQLite is set to `journal_mode=DELETE`, so it should stay as one `.sqlite` file instead of `.sqlite`, `.sqlite-wal`, and `.sqlite-shm`.
+- SQLite is set to `journal_mode=DELETE` inside the learner, so it should normally stay as one `.sqlite` file instead of `.sqlite`, `.sqlite-wal`, and `.sqlite-shm`.
+
+## Optimisation pass
+
+The bot wrapper has been optimised so routine Discord commands do less work and use less memory:
+
+- `known_bits.csv` is cached by file mtime/size instead of being parsed for every command.
+- topology is cached instead of rebuilt for every feed reconnect.
+- SQLite inspection commands use read-only connections where possible.
+- SQLite read cache, busy timeout and optional mmap are configurable from env vars.
+- expensive learner CLI subprocesses are limited by a semaphore so multiple Discord commands cannot spawn lots of Python processes at once.
+- live learner recent-event memory is configurable with `NR_LEARNER_RECENT_KEEP_SECONDS`.
+- feed tick interval is configurable with `NR_FEED_TICK_SECONDS`.
+- reconnect backoff resets after a successful connection.
+- `/download` uses SQLite's online backup API to create a safer DB snapshot instead of zipping the live DB file directly.
+- `/db_optimise` can run SQLite `ANALYZE`, `PRAGMA optimize`, optional purge and optional `VACUUM`.
+- `/recent_bits` reads the raw S-Class bit-change table directly.
+- `/route_bits` reads pass-window evidence directly to find likely route bits.
 
 ## Discord slash commands
 
-- `/status` - shows Discord status, NR feed connected/running state, message count, DB path, known CSV path and latest error.
+- `/status` - shows Discord status, NR feed connected/running state, message count, DB path, known CSV rows, memory and latest error.
 - `/nr_start` - starts the live Network Rail feed learner.
 - `/nr_stop` - stops the live Network Rail feed learner.
-- `/nr_restart` - restarts the live feed learner.
+- `/nr_restart` - restarts the live feed learner and reloads known bits.
 - `/report signal:6232` - runs the learner report for a signal. Known CSV path and DB path are automatic.
 - `/progress` - compact learning progress summary.
-- `/signal signal:6232` - shows berth/headcode occupancy and known signal bit state if known.
+- `/signal signal:6232` - shows berth/headcode occupancy, configured routes/next berths and known signal bit state if known.
 - `/bit bit:25:3` - shows the current/latest state of a byte:bit.
+- `/recent_bits` - shows the most recent raw S-Class bit changes, optionally filtered by signal, byte:bit, known-only, and recent time window.
+- `/route_bits signal:6248` - scores likely route bits from stored pass evidence.
 - `/known signal:6232` - shows known_bits.csv rows for a signal.
 - `/moves signal:6244` - shows learned movements involving a berth/signal.
 - `/bytes` - shows S-Class byte addresses seen.
 - `/missing` - shows missing topology observations.
-- `/download` - sends a zip containing the SQLite DB, known_bits.csv and missing topology CSVs.
+- `/db_stats` - shows SQLite file size, page/free-page counts and table row counts.
+- `/db_optimise` - runs SQLite optimisation and optional purge/vacuum safely by stopping/restarting the live feed.
+- `/download` - sends a zip containing a SQLite DB snapshot, known_bits.csv and missing topology CSVs.
 - `/upload attachment:file` - accepts known_bits.csv, a SQLite DB, or a zip containing them.
 - `/check` - checks topology, known CSV and DB load cleanly.
+
+## Useful command examples
+
+```text
+/recent_bits limit:30
+/recent_bits signal:6248 known_only:true
+/recent_bits bit:25:3 since_minutes:120
+/route_bits signal:6248
+/route_bits signal:6248 to:6244 phase:before min_hits:2
+/db_stats
+/db_optimise vacuum:true
+/db_optimise purge_days:30 vacuum:true
+```
 
 ## Files in this package
 
@@ -86,6 +120,32 @@ For fast slash command sync to one Discord server, set:
 DISCORD_GUILD_ID=your_discord_server_id
 ```
 
+Optional optimisation settings:
+
+```env
+# Limit expensive learner subprocesses. Keep 1 on small LXCs.
+NR_CLI_CONCURRENCY=1
+NR_CLI_TIMEOUT_SECONDS=60
+
+# SQLite command/read tuning. Negative cache_size means KiB.
+NR_DB_BUSY_TIMEOUT_MS=5000
+NR_DB_READ_CACHE_KIB=4096
+NR_DB_MMAP_MIB=0
+
+# Live learner memory/CPU tuning.
+# Lower recent keep uses less memory but reduces pass-window context.
+NR_LEARNER_RECENT_KEEP_SECONDS=180
+NR_FEED_TICK_SECONDS=1.0
+
+# Reconnect backoff.
+NR_RECONNECT_INITIAL_SECONDS=10
+NR_RECONNECT_MAX_SECONDS=300
+
+# Discord command output limits.
+NR_COMMAND_DEFAULT_LIMIT=25
+NR_COMMAND_MAX_LIMIT=100
+```
+
 ## Install on Debian/LXC
 
 Clone to `/opt`:
@@ -129,13 +189,11 @@ Restart and pull latest GitHub code:
 sudo systemctl restart metro-t3-learner
 ```
 
-## Notes
+## Operational notes
 
-`/signal` is intentionally basic in this base version. It shows:
+`/signal` uses the simple display rule currently used by this bot:
 
-- whether the signal/berth currently has a stored headcode from latest CA movement state
-- the known S-Class bit for that signal from `known_bits.csv`
-- whether that bit is currently 1 or 0
-- display meaning used here: `1 = ON/red`, `0 = OFF/proceed`
+- `1 = ON/red`
+- `0 = OFF/proceed`
 
-The full advanced aspect/route decoder can be built later on top of this.
+Route-bit discovery is evidence-based. `/route_bits` does not permanently edit `known_bits.csv`; it helps you decide which bits to add to the CSV after checking the score, pass count and route context.
