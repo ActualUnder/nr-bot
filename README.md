@@ -33,13 +33,26 @@ The bot wrapper has been optimised so routine Discord commands do less work and 
 - `/recent_bits` reads the raw S-Class bit-change table directly.
 - `/route_bits` reads pass-window evidence directly to find likely route bits.
 
+
+## Current v3 signal-state fixes
+
+This version includes extra guards for the 6244/6263 style fault where `/bit` could briefly disagree with `/recent_bits`:
+
+- stale/out-of-order S-Class byte snapshots are ignored in the live learner instead of overwriting newer byte state;
+- stale/out-of-order C-Class berth messages are ignored so berth/headcode state cannot be rolled backwards by an older CA/CB/CC;
+- SQLite `s_bytes` and `berth_state` updates now only replace existing rows when the incoming TD timestamp is newer or equal;
+- `/bit` and `/signal` recover from older databases by preferring a newer raw `s_bit_events` entry over a stale `s_bytes` snapshot for the exact bit;
+- `/report` now exposes `show_cross_known`, `min_pass_count`, `min_pct`, and `max_avg_delta` as Discord slash-command options.
+
+For low-evidence signals such as `6244` with only one or two finalised passes, treat `25:3` as an observed proceed/route-set candidate until more pass windows confirm it. A pattern like `0->1` just before the train leaves and `1->0` after it passes means `1 = proceed/route set`, not `1 = red`.
+
 ## Discord slash commands
 
 - `/status` - shows Discord status, NR feed connected/running state, message count, DB path, known CSV rows, memory and latest error.
 - `/nr_start` - starts the live Network Rail feed learner.
 - `/nr_stop` - stops the live Network Rail feed learner.
 - `/nr_restart` - restarts the live feed learner and reloads known bits.
-- `/report signal:6232` - runs the learner report for a signal. Known CSV path and DB path are automatic.
+- `/report signal:6232` - runs the learner report for a signal. Known CSV path and DB path are automatic. Options include `show_known`, `show_cross_known`, `min_pass_count`, `min_pct`, and `max_avg_delta`.
 - `/progress` - compact learning progress summary.
 - `/signal signal:6232` - shows berth/headcode occupancy, configured routes/next berths, CSV mapped raw bit state, and the strongest learned bit candidates from pass evidence.
 - `/bit bit:25:3` - shows the current/latest state of a byte:bit.
@@ -59,6 +72,8 @@ The bot wrapper has been optimised so routine Discord commands do less work and 
 ## Useful command examples
 
 ```text
+/report signal:6244 show_known:true min_pass_count:1 max_avg_delta:0
+/report signal:6244 show_known:true show_cross_known:true min_pass_count:1 max_avg_delta:0
 /recent_bits limit:30
 /recent_bits signal:6248 known_only:true
 /recent_bits bit:25:3 since_minutes:120
