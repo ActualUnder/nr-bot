@@ -1619,9 +1619,9 @@ def print_signal_report(
         printable.append((r, key, best))
 
     if hidden_own_known and not show_known:
-        print(f"Own known bit row(s) hidden from candidate list: {hidden_own_known} (use --show-known to audit this signal's known bit)")
+        print(f"Own known bit row(s) hidden from candidate list: {hidden_own_known} (Discord: show_known:true / CLI: --show-known to audit this signal's known bit)")
     if hidden_cross_known:
-        print(f"Other-signal known bit row(s) suppressed: {hidden_cross_known} (use --show-cross-known to inspect contamination)")
+        print(f"Other-signal known bit row(s) suppressed: {hidden_cross_known} (Discord: show_cross_known:true / CLI: --show-cross-known to inspect contamination)")
 
     printable.sort(key=lambda item: (item[2]["pct"], item[2]["best_count"], -float(item[0]["avg_abs"] or 9999)), reverse=True)
     if not printable:
@@ -2340,7 +2340,7 @@ def build_parser() -> argparse.ArgumentParser:
     bit.add_argument("--limit", type=int, default=80)
     bit.add_argument("--evidence", action="store_true", help="Show noisy pass-window attachments instead of raw/de-duplicated bit history.")
     bit.add_argument("--details", action="store_true", help="Show full-byte hex/debug context. Default prints: time signal route headcode addr XX bN changed A->B")
-    bit.add_argument("--link-window", type=float, default=30.0, help="Seconds either side used to link a known bit to a pass for its mapped signal. Default: 30")
+    bit.add_argument("--link-window", type=float, default=180.0, help="Seconds either side used to link a known bit to a pass for its mapped signal. Default: 180")
 
     bytes_p = sub.add_parser("bytes", aliases=["byte-map", "byte-summary"], help="List S-Class byte addresses/bits the learner has seen, without using sqlite3 manually.")
     add_common(bytes_p)
