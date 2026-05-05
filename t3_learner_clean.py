@@ -1477,6 +1477,13 @@ def print_signal_report(
         print("No evidence yet.")
         return
 
+    if pass_count < min_pass_count:
+        print(
+            f"Low evidence warning: only {pass_count} finalised pass(es). "
+            f"Normal candidate rows need at least {min_pass_count} supporting hits; "
+            "use --min-pass-count 1 only for raw investigation."
+        )
+
     rows = store.candidate_rows(signal_id, score_window=score_window, limit=max(limit * 12, 200))
     row_by_key: Dict[BitKey, sqlite3.Row] = {}
     for r in rows:
@@ -2220,8 +2227,8 @@ def build_parser() -> argparse.ArgumentParser:
     report.add_argument("--signals", action="append", default=[])
     report.add_argument("--all", action="store_true")
     report.add_argument("--score-window", type=float, default=12.0)
-    report.add_argument("--min-pct", "--min-percent", dest="min_pct", type=float, default=0.40, help="Minimum candidate consistency. Use 0.8 or 80 for 80%%. Default 0.40")
-    report.add_argument("--min-pass-count", type=int, default=1, help="Minimum number of passes supporting the best bucket. Default 1")
+    report.add_argument("--min-pct", "--min-percent", dest="min_pct", type=float, default=0.80, help="Minimum candidate consistency. Use 0.8 or 80 for 80%%. Default 0.80")
+    report.add_argument("--min-pass-count", type=int, default=3, help="Minimum number of passes supporting the best bucket. Default 3; use 1 for raw exploratory reports")
     report.add_argument("--max-avg-delta", type=float, default=None, help="Only show rows whose average timing delta is <= this many seconds")
     report.add_argument("--limit", type=int, default=12)
     report.add_argument("--show-known", action="store_true", help="Audit this signal's own known CSV bit(s) separately from unknown candidates.")

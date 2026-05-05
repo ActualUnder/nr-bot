@@ -47,6 +47,7 @@ The bot wrapper has been optimised so routine Discord commands do less work and 
 - `/route_bits signal:6248` - scores likely route bits from stored pass evidence.
 - `/known signal:6232` - shows known_bits.csv rows for a signal.
 - `/moves signal:6244` - shows learned movements involving a berth/signal.
+- `/berths` - shows currently stored berth/headcode states; useful when `/signal` does not show the headcode you expect.
 - `/bytes` - shows S-Class byte addresses seen.
 - `/missing` - shows missing topology observations.
 - `/db_stats` - shows SQLite file size, page/free-page counts and table row counts.
@@ -62,6 +63,8 @@ The bot wrapper has been optimised so routine Discord commands do less work and 
 /recent_bits signal:6248 known_only:true
 /recent_bits bit:25:3 since_minutes:120
 /route_bits signal:6248
+/berths occupied_only:true limit:50
+/berths berth:62 occupied_only:false
 /route_bits signal:6248 to:6244 phase:before min_hits:2
 /db_stats
 /db_optimise vacuum:true
@@ -205,3 +208,30 @@ Treat old compact CSV mappings as suspect if the CSV bit is not one of the top l
 Berth/headcode state is now updated from CA step, CB cancel and CC interpose messages. Older runs only used CA, which meant directly interposed or cancelled headcodes could be missing/stale in `/signal`. Restart the bot and let the live feed run to refresh the berth table.
 
 Route-bit discovery is evidence-based. `/route_bits` does not permanently edit `known_bits.csv`; it helps you decide which bits to add to the CSV after checking the score, pass count and route context.
+
+## 2026-05-05 signal-state interpretation fix
+
+The Discord `/signal` command now uses stricter evidence before it derives a live signal state from learned pass-window candidates.
+
+Default live-state thresholds:
+
+```env
+NR_DERIVE_MIN_SUPPORT=3
+NR_DERIVE_MIN_PCT=0.80
+NR_DERIVE_MAX_AVG_DELTA=3.0
+NR_DERIVE_FLICKER_WINDOW_SECONDS=7200
+NR_DERIVE_FLICKER_WARN_CHANGES=8
+```
+
+This stops one-pass rows such as `1/1 (100%)` from being shown as if they prove a live signal state. A single train movement can capture unrelated S-Class changes nearby, so those rows are now displayed as low-evidence only.
+
+For high-confidence proceed-active bits, `/signal` now interprets the useful operational state like this:
+
+- raw `1` on a learned proceed bit = likely proceed/route set
+- raw `0` on a learned proceed bit = likely red/danger or no route set, because no proceed is proved
+
+This is why a real red signal may correctly show its learned proceed bit as `0`. The raw bit is not necessarily a red lamp bit; it may be a proceed proving, route set, or control indication bit.
+
+If a CSV mapped bit changes repeatedly while the panel signal looks steady, `/signal` warns that the bit is probably not a steady red-lamp state bit. Use `/recent_bits bit:XX:Y since_minutes:120` and `/report signal:#### show_known:true` to check whether the CSV row is contaminated or only a route/proceed bit.
+
+The offline `report` command now defaults to `--min-pct 0.80 --min-pass-count 3`. Use `--min-pass-count 1` only for raw investigation when you intentionally want to see weak one-pass rows.
