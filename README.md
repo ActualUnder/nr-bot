@@ -41,7 +41,7 @@ The bot wrapper has been optimised so routine Discord commands do less work and 
 - `/nr_restart` - restarts the live feed learner and reloads known bits.
 - `/report signal:6232` - runs the learner report for a signal. Known CSV path and DB path are automatic.
 - `/progress` - compact learning progress summary.
-- `/signal signal:6232` - shows berth/headcode occupancy, configured routes/next berths and known signal bit state if known.
+- `/signal signal:6232` - shows berth/headcode occupancy, configured routes/next berths, CSV mapped raw bit state, and the strongest learned bit candidates from pass evidence.
 - `/bit bit:25:3` - shows the current/latest state of a byte:bit.
 - `/recent_bits` - shows the most recent raw S-Class bit changes, optionally filtered by signal, byte:bit, known-only, and recent time window.
 - `/route_bits signal:6248` - scores likely route bits from stored pass evidence.
@@ -191,9 +191,17 @@ sudo systemctl restart metro-t3-learner
 
 ## Operational notes
 
-`/signal` uses the simple display rule currently used by this bot:
+`/signal` no longer assumes every S-Class bit uses `1 = red` and `0 = proceed`. The command now shows the raw bit value unless `known_bits.csv` explicitly declares the polarity in the `Active State` column. This avoids false output where an unverified CSV row made a red signal look like proceed.
 
-- `1 = ON/red`
-- `0 = OFF/proceed`
+`/signal` also shows learned candidates from `pass_bit_events`. These are evidence-based correlations around CA pass windows. The useful patterns are:
+
+- `before 1->0` usually means a red/danger bit cleared before a train passed, so `1 = red/danger` and `0 = not red/cleared`.
+- `after 0->1` usually means a red/danger bit restored after a train passed, so `1 = red/danger` and `0 = not red/cleared`.
+- `before 0->1` usually means a proceed/route bit set before a train passed, so `1 = proceed/route set`.
+- `after 1->0` usually means a proceed/route bit released after a train passed.
+
+Treat old compact CSV mappings as suspect if the CSV bit is not one of the top learned candidates for that signal. In that case, confirm against the panel before using it as the live aspect.
+
+Berth/headcode state is now updated from CA step, CB cancel and CC interpose messages. Older runs only used CA, which meant directly interposed or cancelled headcodes could be missing/stale in `/signal`. Restart the bot and let the live feed run to refresh the berth table.
 
 Route-bit discovery is evidence-based. `/route_bits` does not permanently edit `known_bits.csv`; it helps you decide which bits to add to the CSV after checking the score, pass count and route context.
