@@ -177,6 +177,15 @@ def load_config() -> Config:
 
 CFG = load_config()
 
+# Evidence needed before the Discord bot turns pass-window statistics into a
+# user-facing signal-state interpretation.  One pass can produce many perfectly
+# timed but unrelated S-Class changes, so never derive live state from 1/1 rows.
+DERIVE_MIN_SUPPORT = env_int("NR_DERIVE_MIN_SUPPORT", 3, minimum=1, maximum=50)
+DERIVE_MIN_PCT = env_float("NR_DERIVE_MIN_PCT", 0.80, minimum=0.0, maximum=1.0)
+DERIVE_MAX_AVG_DELTA = env_float("NR_DERIVE_MAX_AVG_DELTA", 3.0, minimum=0.1, maximum=30.0)
+DERIVE_FLICKER_WINDOW_SECONDS = env_float("NR_DERIVE_FLICKER_WINDOW_SECONDS", 2 * 60 * 60, minimum=60.0, maximum=24 * 60 * 60)
+DERIVE_FLICKER_WARN_CHANGES = env_int("NR_DERIVE_FLICKER_WARN_CHANGES", 8, minimum=2, maximum=500)
+
 
 def ensure_dirs() -> None:
     for path in [CFG.learner_dir, CFG.missing_dir, CFG.exports_dir, CFG.uploads_dir, CFG.backups_dir, CFG.logs_dir]:
@@ -470,30 +479,100 @@ def candidate_best_for_display(row: sqlite3.Row, pass_count: int) -> dict[str, A
     after_on = int(row["after_on"] or 0)
     after_off = int(row["after_off"] or 0)
     choices = [
-        (before_on, "before 0->1", "likely proceed/route set before pass", "1=proceed/route set, 0=not set"),
-        (before_off, "before 1->0", "likely red/danger cleared before pass", "1=red/danger, 0=not red/cleared"),
-        (after_on, "after 0->1", "likely red/danger restored after pass", "1=red/danger, 0=not red/cleared"),
-        (after_off, "after 1->0", "likely proceed/route released after pass", "1=proceed/route set, 0=not set"),
+        (before_on, "before 0->1", "likely proceed/route set before pass", "proceed_active_high"),
+        (before_off, "before 1->0", "likely red/danger cleared before pass", "danger_active_high"),
+        (after_on, "after 0->1", "likely red/danger restored after pass", "danger_active_high"),
+        (after_off, "after 1->0", "likely proceed/route released after pass", "proceed_active_high"),
     ]
     best_count, bucket, guess, polarity = max(choices, key=lambda x: x[0])
     pct = (best_count / pass_count) if pass_count else 0.0
+    avg_abs = float(row["avg_abs"] or 0.0)
+    confidence_ok = (
+        int(best_count) >= DERIVE_MIN_SUPPORT
+        and float(pct) >= DERIVE_MIN_PCT
+        and avg_abs <= DERIVE_MAX_AVG_DELTA
+    )
+    if polarity == "proceed_active_high":
+        polarity_text = "1=proceed/route set, 0=no proceed proved"
+    else:
+        polarity_text = "1=red/danger, 0=not red/cleared"
     return {
         "best_count": best_count,
         "bucket": bucket,
         "guess": guess,
         "polarity": polarity,
+        "polarity_text": polarity_text,
         "pct": pct,
+        "avg_abs": avg_abs,
+        "confidence_ok": confidence_ok,
     }
 
 
-def describe_candidate_current(raw_value: int | None, polarity: str) -> str:
+def confidence_text(best: dict[str, Any], pass_count: int) -> str:
+    return (
+        f"{best['best_count']}/{pass_count} ({best['pct']*100:.0f}%), "
+        f"avg_delta={best['avg_abs']:.1f}s"
+    )
+
+
+def describe_candidate_current(raw_value: int | None, best: dict[str, Any], *, signal_view: bool = True) -> str:
     if raw_value is None:
         return "current unknown"
-    if "1=red" in polarity:
-        return "current red/danger" if raw_value == 1 else "current not red/cleared"
-    if "1=proceed" in polarity:
-        return "current proceed/route set" if raw_value == 1 else "current not set"
+    if not best.get("confidence_ok"):
+        return f"current raw {raw_value}; low evidence, not deriving state"
+    polarity = str(best.get("polarity", ""))
+    if polarity == "danger_active_high":
+        return "current likely RED/DANGER" if raw_value == 1 else "current likely not red/cleared"
+    if polarity == "proceed_active_high":
+        if raw_value == 1:
+            return "current likely PROCEED / route set"
+        # In a signal-specific view this is the useful operational conclusion:
+        # the learned proceed/proof bit is not active.  It still does not tell
+        # us the exact red/yellow/double-yellow/green aspect.
+        return "current likely RED/DANGER or no route set (proceed bit not active)" if signal_view else "current proceed bit not active"
     return f"current raw {raw_value}"
+
+
+def recent_bit_change_count(conn: sqlite3.Connection, key: learner_mod.BitKey, *, seconds: float) -> int:
+    if not table_exists(conn, "s_bit_events"):
+        return 0
+    row = conn.execute(
+        """
+        SELECT COUNT(*) AS c
+        FROM s_bit_events
+        WHERE area=? AND address=? AND bit=? AND event_ts >= ?
+        """,
+        (CFG.nr_area, int(key.address, 16), int(key.bit), time.time() - float(seconds)),
+    ).fetchone()
+    return int(row["c"] if row else 0)
+
+
+def signal_bit_interpretation_line(
+    conn: sqlite3.Connection,
+    key: learner_mod.BitKey,
+    val: int | None,
+    updated_ts: float | None,
+    msg_type: str | None,
+    best: dict[str, Any] | None,
+    pass_count: int,
+) -> str:
+    if val is None:
+        return f"  {key.label}: no current S-Class byte snapshot"
+    raw_prefix = f"  {key.label}: raw {val}"
+    suffix = f" at {fmt_ts(updated_ts)} (src {msg_type or '?'})"
+    if best and best.get("confidence_ok"):
+        return (
+            f"{raw_prefix} -> {describe_candidate_current(val, best)}; "
+            f"learned {best['bucket']} {confidence_text(best, pass_count)}; "
+            f"{best['polarity_text']}{suffix}"
+        )
+    if best:
+        return (
+            f"{raw_prefix} (uninterpreted; own evidence only "
+            f"{confidence_text(best, pass_count)}, below threshold "
+            f"{DERIVE_MIN_SUPPORT} hits/{DERIVE_MIN_PCT*100:.0f}%/{DERIVE_MAX_AVG_DELTA:.1f}s){suffix}"
+        )
+    return f"{raw_prefix} (uninterpreted; no pass-window evidence for this signal bit yet){suffix}"
 
 
 class Status:
@@ -819,6 +898,65 @@ async def moves_cmd(interaction: discord.Interaction, signal: str, limit: int = 
     await send_text(interaction, text, paged=True)
 
 
+@bot.tree.command(name="berths", description="Show stored TD berth/headcode states.")
+@app_commands.describe(
+    berth="Optional exact berth or prefix, e.g. 6263 or 62",
+    occupied_only="Only show occupied berths",
+    limit="Maximum rows to show",
+)
+async def berths_cmd(
+    interaction: discord.Interaction,
+    berth: Optional[str] = None,
+    occupied_only: bool = True,
+    limit: int = 40,
+) -> None:
+    await interaction.response.defer()
+    try:
+        if not CFG.db_path.exists():
+            await send_text(interaction, "Database does not exist yet.")
+            return
+        max_rows = clamp_limit(limit)
+        with db_connect(readonly=True) as conn:
+            if not table_exists(conn, "berth_state"):
+                await send_text(interaction, "No berth_state table yet.")
+                return
+            where = []
+            params: list[Any] = []
+            title = "Stored berth/headcode states"
+            if berth:
+                q = learner_mod.normalize_berth(berth)
+                title += f" matching {q}"
+                if len(q) >= 4:
+                    where.append("berth=?")
+                    params.append(q)
+                else:
+                    where.append("berth LIKE ?")
+                    params.append(q + "%")
+            if occupied_only:
+                where.append("occupied=1")
+            sql = "SELECT berth, descr, occupied, updated_ts, source_msg_type FROM berth_state"
+            if where:
+                sql += " WHERE " + " AND ".join(where)
+            sql += " ORDER BY occupied DESC, updated_ts DESC LIMIT ?"
+            params.append(max_rows)
+            rows = conn.execute(sql, params).fetchall()
+
+        lines = [title]
+        if not rows:
+            lines.append("No matching stored berth state.")
+            lines.append("Note: TD C-Class is delta based. After a bot restart, a train already sitting in a berth may not appear until the next CA/CB/CC update for that berth.")
+        else:
+            for r in rows:
+                state = "occupied" if int(r["occupied"]) else "clear"
+                descr = r["descr"] or "-"
+                lines.append(f"{r['berth']}: {state} {descr} | {fmt_ts(float(r['updated_ts']))} via {r['source_msg_type'] or '?'}")
+            if len(rows) >= max_rows:
+                lines.append(f"Showing first {max_rows} rows. Increase limit or add a berth/prefix filter.")
+        await send_text(interaction, "\n".join(lines), paged=True)
+    except Exception as exc:
+        await send_text(interaction, f"Error: {exc}")
+
+
 @bot.tree.command(name="bytes", description="Show S-Class byte addresses seen by the learner.")
 async def bytes_cmd(interaction: discord.Interaction) -> None:
     await interaction.response.defer()
@@ -941,40 +1079,64 @@ async def signal_cmd(interaction: discord.Interaction, signal: str) -> None:
                 if occupied_nexts:
                     lines.append("Train/headcode in next berth(s): " + ", ".join(occupied_nexts))
 
+            pass_count = pass_count_for_signal(conn, sig)
+            candidates = learned_candidate_rows(conn, sig, score_window=12.0, limit=25)
+            known_key_set = set(keys)
+            candidate_by_key: dict[learner_mod.BitKey, tuple[sqlite3.Row, dict[str, Any]]] = {}
+            for row in candidates:
+                ckey = learner_mod.BitKey(f"{int(row['address']):02X}", int(row["bit"]))
+                candidate_by_key[ckey] = (row, candidate_best_for_display(row, pass_count))
+
             if not keys:
                 lines.append("CSV mapped signal bit: none in known_bits.csv")
             else:
                 lines.append("CSV mapped bit state:")
                 for key in keys:
                     val, updated_ts, msg_type = current_bit_value(conn, key)
-                    if val is None:
-                        lines.append(f"  {key.label}: no current S-Class byte snapshot")
-                        continue
-                    state_text = describe_raw_bit_state(known, key, val)
-                    lines.append(f"  {key.label}: {state_text} at {fmt_ts(updated_ts)} (src {msg_type or '?'})")
+                    best = candidate_by_key.get(key, (None, None))[1]
+                    lines.append(signal_bit_interpretation_line(conn, key, val, updated_ts, msg_type, best, pass_count))
+                    changes = recent_bit_change_count(conn, key, seconds=DERIVE_FLICKER_WINDOW_SECONDS)
+                    if changes >= DERIVE_FLICKER_WARN_CHANGES and not (best and best.get("confidence_ok")):
+                        lines.append(
+                            f"    Warning: {key.label} changed {changes} times in the last "
+                            f"{DERIVE_FLICKER_WINDOW_SECONDS/60:.0f}m; this is probably not a steady red-lamp state bit."
+                        )
 
-            pass_count = pass_count_for_signal(conn, sig)
-            candidates = learned_candidate_rows(conn, sig, score_window=12.0, limit=6)
             if pass_count and candidates:
-                lines.append(f"Learned candidates from pass evidence ({pass_count} finalised passes):")
-                known_key_set = set(keys)
-                for row in candidates[:5]:
+                confident = []
+                low = []
+                for row in candidates:
                     key = learner_mod.BitKey(f"{int(row['address']):02X}", int(row["bit"]))
                     best = candidate_best_for_display(row, pass_count)
                     if best["best_count"] <= 0:
                         continue
-                    val, updated_ts, msg_type = current_bit_value(conn, key)
-                    current_text = describe_candidate_current(val, best["polarity"])
-                    marker = "CSV" if key in known_key_set else "learned"
-                    lines.append(
-                        f"  {key.label}: {marker}; {best['bucket']} "
-                        f"{best['best_count']}/{pass_count} ({best['pct']*100:.0f}%), "
-                        f"avg_delta={float(row['avg_abs'] or 0.0):.1f}s; "
-                        f"{best['guess']}; {best['polarity']}; {current_text}"
-                    )
+                    (confident if best["confidence_ok"] else low).append((row, key, best))
 
-                if keys and all(learner_mod.BitKey(f"{int(r['address']):02X}", int(r["bit"])) not in known_key_set for r in candidates[:3]):
-                    lines.append("Warning: the CSV mapped bit is not one of the top learned candidates for this signal. Treat the CSV aspect as suspect until checked on the panel.")
+                lines.append(f"Learned candidates from pass evidence ({pass_count} finalised passes):")
+                if confident:
+                    for row, key, best in confident[:5]:
+                        val, updated_ts, msg_type = current_bit_value(conn, key)
+                        current_text = describe_candidate_current(val, best)
+                        marker = "CSV" if key in known_key_set else "learned"
+                        lines.append(
+                            f"  {key.label}: {marker}; {best['bucket']} "
+                            f"{confidence_text(best, pass_count)}; "
+                            f"{best['guess']}; {best['polarity_text']}; {current_text}"
+                        )
+                else:
+                    lines.append(
+                        f"  No high-confidence live-state candidates yet "
+                        f"(need >= {DERIVE_MIN_SUPPORT} hits, >= {DERIVE_MIN_PCT*100:.0f}%, avg_delta <= {DERIVE_MAX_AVG_DELTA:.1f}s)."
+                    )
+                    for row, key, best in low[:3]:
+                        marker = "CSV" if key in known_key_set else "learned"
+                        lines.append(
+                            f"  low-evidence {key.label}: {marker}; {best['bucket']} "
+                            f"{confidence_text(best, pass_count)}; not used for live state"
+                        )
+
+                if keys and confident and all(item[1] not in known_key_set for item in confident[:3]):
+                    lines.append("Warning: the CSV mapped bit is not one of the top high-confidence learned candidates for this signal. Treat the CSV aspect as suspect until checked on the panel.")
             elif not pass_count:
                 lines.append("Learned candidates: no finalised CA pass evidence yet.")
 
