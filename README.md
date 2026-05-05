@@ -1,5 +1,30 @@
 # READ ME MUST ALWAYS BE UPDATED
 
+### 2026-05-05 v6 bit-correlation scan update
+
+This version adds `/bit_correlate`, which scans one raw S-Class byte:bit against all captured C-Class/pass_log movements instead of checking only one chosen signal. This is useful for low-use siding bits such as `25:3`, where the bit may line up with a 6244 move but also toggle at other times because it actually belongs to another signal/berth, a shared route condition, or a noisy/wrong CSV row.
+
+Use it like:
+
+```text
+/bit_correlate bit:25:3 since_minutes:240 match_window_seconds:180 limit:20
+```
+
+Read the output as a ranking, not proof. A good signal-specific candidate should have lots of matched bit changes, low average delta, and not many extra raw changes away from that signal's movements. If the CSV mapped signal is not near the top, or many neighbouring berths score better, downgrade the CSV row until checked against the panel.
+
+
+### 2026-05-05 v4 diagnostic update
+
+This version improves the live signal diagnostics further:
+
+- `/signal` now shows the latest C-Class pass/move history involving the berth, so a train that has already stepped out can still be seen in context instead of only showing the current clear/occupied state.
+- `/bit` now shows the learned interpretation for mapped signal bits, including low-evidence rows clearly marked as low evidence. For example, a mapped proceed bit with raw `0` may be shown as "low-evidence suggests red/danger or no route set" rather than just "raw 0".
+- `/moves` exposes `show_events` and `event_limit` in Discord, matching the CLI `--show-events` investigation mode.
+- Report hints now mention both Discord option names and CLI flags, e.g. `show_cross_known:true` as well as `--show-cross-known`.
+
+Important: a berth state is a latest-state cache. If a train was in berth 6244 at 09:20 and then stepped to 6241/6242, `/signal 6244` should show the berth as clear later, while the new movement history should still show the 09:20 move.
+
+
 # Metro T3 Learner Discord Bot
 
 This is a Discord slash-command controlled bot wrapped around `t3_learner_clean.py` for the T3 Network Rail TD/S-Class learner.
@@ -31,6 +56,8 @@ The bot wrapper has been optimised so routine Discord commands do less work and 
 - `/download` uses SQLite's online backup API to create a safer DB snapshot instead of zipping the live DB file directly.
 - `/db_optimise` can run SQLite `ANALYZE`, `PRAGMA optimize`, optional purge and optional `VACUUM`.
 - `/recent_bits` reads the raw S-Class bit-change table directly.
+- `/bit_trace` compares one bit against one signal's movements.
+- `/bit_correlate` ranks all signals/berths that move near one raw bit, which helps find wrong/shared CSV mappings.
 - `/route_bits` reads pass-window evidence directly to find likely route bits.
 
 
@@ -57,6 +84,8 @@ For low-evidence signals such as `6244` with only one or two finalised passes, t
 - `/signal signal:6232` - shows berth/headcode occupancy, configured routes/next berths, CSV mapped raw bit state, and the strongest learned bit candidates from pass evidence.
 - `/bit bit:25:3` - shows the current/latest state of a byte:bit.
 - `/recent_bits` - shows the most recent raw S-Class bit changes, optionally filtered by signal, byte:bit, known-only, and recent time window.
+- `/bit_trace bit:25:3 signal:6244` - checks whether one bit's changes line up with one signal/berth's movements.
+- `/bit_correlate bit:25:3` - scans that bit against all captured signal/berth movements and ranks likely correlations.
 - `/route_bits signal:6248` - scores likely route bits from stored pass evidence.
 - `/known signal:6232` - shows known_bits.csv rows for a signal.
 - `/moves signal:6244` - shows learned movements involving a berth/signal.
@@ -77,6 +106,8 @@ For low-evidence signals such as `6244` with only one or two finalised passes, t
 /recent_bits limit:30
 /recent_bits signal:6248 known_only:true
 /recent_bits bit:25:3 since_minutes:120
+/bit_trace bit:25:3 signal:6244 since_minutes:240 match_window_seconds:180
+/bit_correlate bit:25:3 since_minutes:240 match_window_seconds:180 limit:20
 /route_bits signal:6248
 /berths occupied_only:true limit:50
 /berths berth:62 occupied_only:false
@@ -250,3 +281,21 @@ This is why a real red signal may correctly show its learned proceed bit as `0`.
 If a CSV mapped bit changes repeatedly while the panel signal looks steady, `/signal` warns that the bit is probably not a steady red-lamp state bit. Use `/recent_bits bit:XX:Y since_minutes:120` and `/report signal:#### show_known:true` to check whether the CSV row is contaminated or only a route/proceed bit.
 
 The offline `report` command now defaults to `--min-pct 0.80 --min-pass-count 3`. Use `--min-pass-count 1` only for raw investigation when you intentionally want to see weak one-pass rows.
+
+
+## v5 signal/bit correlation diagnostics
+
+Low-use sidings can make bad CSV mappings obvious. A bit may line up with the one or two captured passes, but still toggle many other times when that siding has no movement. The bot now compares raw S-Class bit flips against C-Class pass/move rows for the mapped signal.
+
+Useful commands:
+
+```text
+/signal 6244
+/bit_trace bit:25:3 signal:6244 since_minutes:180 match_window_seconds:180
+/recent_bits bit:25:3 since_minutes:180
+/moves signal:6244 limit:20 show_events:true
+```
+
+If `/bit_trace` shows many `NO MATCH to this signal` rows, do not trust that bit as the live signal state even if `/report show_known:true` says the bit lined up with the small number of passes. Then use `/bit_correlate` to find whether the same raw bit lines up better with a neighbouring signal, from-berth, to-berth, or shared route movement.
+
+Times are shown using the host machine timezone. If the LXC is on UTC, the bot output will be UTC rather than BST. Use `timedatectl` on the host/container if you want Discord output to show Europe/London local time.
