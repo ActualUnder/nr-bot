@@ -658,17 +658,47 @@ class Store:
             rows = self.conn.execute("SELECT address,value FROM s_bytes WHERE area=?", (area,)).fetchall()
             return {int(r["address"]): int(r["value"]) for r in rows}
 
+    def load_byte_timestamps(self, area: str) -> Dict[int, float]:
+        """Return latest stored S-Class timestamp per byte address.
+
+        STOMP frames can arrive with TD message times slightly out of order.
+        Keeping the timestamp alongside the byte prevents a stale S-Class
+        snapshot from overwriting a newer state and producing impossible
+        /bit output such as current=1 while the newest raw event is 1->0.
+        """
+        with self.lock:
+            rows = self.conn.execute("SELECT address,updated_ts FROM s_bytes WHERE area=?", (area,)).fetchall()
+            return {int(r["address"]): float(r["updated_ts"]) for r in rows}
+
+    def load_berth_timestamps(self) -> Dict[str, float]:
+        with self.lock:
+            try:
+                rows = self.conn.execute("SELECT berth,updated_ts FROM berth_state").fetchall()
+            except sqlite3.OperationalError as exc:
+                if "no such table" in str(exc).lower():
+                    return {}
+                raise
+            return {normalize_berth(r["berth"]): float(r["updated_ts"]) for r in rows}
+
     def save_byte(self, area: str, address: int, value: int, msg_type: str, ts: float) -> None:
         with self.lock, self.conn:
             self.conn.execute("""
                 INSERT INTO s_bytes(area,address,value,msg_type,updated_ts)
                 VALUES(?,?,?,?,?)
                 ON CONFLICT(area,address) DO UPDATE SET
-                    value=excluded.value, msg_type=excluded.msg_type, updated_ts=excluded.updated_ts
+                    value=excluded.value,
+                    msg_type=excluded.msg_type,
+                    updated_ts=excluded.updated_ts
+                WHERE excluded.updated_ts >= s_bytes.updated_ts
             """, (area, address, value, msg_type, ts))
 
     def record_berth_state(self, berth: str, descr: str, occupied: bool, ts: float, msg_type: str) -> None:
-        """Store a simple latest berth/headcode occupancy state for Discord /signal."""
+        """Store a simple latest berth/headcode occupancy state for Discord /signal.
+
+        The ON CONFLICT guard prevents a late older C-Class message from making
+        a berth look occupied/clear in the past after a newer CA/CB/CC has
+        already been processed.
+        """
         if getattr(self, "read_only", False):
             return
         with self.lock, self.conn:
@@ -680,6 +710,7 @@ class Store:
                     occupied=excluded.occupied,
                     updated_ts=excluded.updated_ts,
                     source_msg_type=excluded.source_msg_type
+                WHERE excluded.updated_ts >= berth_state.updated_ts
             """, (
                 normalize_berth(berth),
                 str(descr or "").strip(),
@@ -1191,6 +1222,8 @@ class Learner:
         self.record_unmapped_routes = bool(record_unmapped_routes)
 
         self.current_bytes = self.store.load_bytes(self.area)
+        self.current_byte_ts = self.store.load_byte_timestamps(self.area)
+        self.berth_ts = self.store.load_berth_timestamps()
         self.recent_events: Deque[BitEvent] = collections.deque(maxlen=25000)
         self.pending: List[PassWindow] = []
         self.lock = threading.RLock()
@@ -1228,8 +1261,18 @@ class Learner:
         with self.lock:
             for offset, new_value in enumerate(data_bytes):
                 address = start_address + offset
+                old_ts = self.current_byte_ts.get(address)
+                if old_ts is not None and ts < old_ts - 0.001:
+                    if self.print_s:
+                        print(
+                            f"[S-SKIP-STALE] {fmt_ts(ts)} {msg_type} addr {address:02X} "
+                            f"ignored because latest stored byte is {fmt_ts(old_ts)}"
+                        )
+                    continue
+
                 old_value = self.current_bytes.get(address)
                 self.current_bytes[address] = new_value
+                self.current_byte_ts[address] = ts
                 self.store.save_byte(self.area, address, new_value, msg_type, ts)
 
                 if old_value is None:
@@ -1266,6 +1309,17 @@ class Learner:
         state = "KNOWN" if self.known.described(key) else "UNKNOWN"
         print(f"[WATCH] {event.compact()} {state} :: {self.known.describe(key)}", flush=True)
 
+    def _is_stale_berth_message(self, ts: float, *berths: str) -> bool:
+        latest = [self.berth_ts.get(normalize_berth(b)) for b in berths if normalize_berth(b)]
+        latest = [x for x in latest if x is not None]
+        return bool(latest and ts < max(latest) - 0.001)
+
+    def _mark_berth_ts(self, ts: float, *berths: str) -> None:
+        for berth in berths:
+            berth = normalize_berth(berth)
+            if berth:
+                self.berth_ts[berth] = max(float(ts), float(self.berth_ts.get(berth, 0.0)))
+
     def _handle_c(self, msg_type: str, msg: Dict[str, Any]) -> None:
         ts = parse_nr_time_ms(msg.get("time"))
         if self.print_c and msg_type != "CT":
@@ -1280,6 +1334,11 @@ class Learner:
             berth = normalize_berth(msg.get("from") or msg.get("to") or msg.get("berth") or msg.get("address") or "")
             descr = str(msg.get("descr", "") or "").strip()
             if berth:
+                if self._is_stale_berth_message(ts, berth):
+                    if self.print_c:
+                        print(f"[C-SKIP-STALE] {fmt_ts(ts)} {msg_type} {berth} newer={fmt_ts(self.berth_ts.get(berth))}")
+                    return
+                self._mark_berth_ts(ts, berth)
                 self.store.record_berth_state(berth, "", False, ts, msg_type)
                 self._check_missing_topology(ts, descr, berth, berth, msg)
             return
@@ -1288,6 +1347,11 @@ class Learner:
             berth = normalize_berth(msg.get("to") or msg.get("from") or msg.get("berth") or msg.get("address") or "")
             descr = str(msg.get("descr", "") or "").strip()
             if berth:
+                if self._is_stale_berth_message(ts, berth):
+                    if self.print_c:
+                        print(f"[C-SKIP-STALE] {fmt_ts(ts)} {msg_type} {berth} newer={fmt_ts(self.berth_ts.get(berth))}")
+                    return
+                self._mark_berth_ts(ts, berth)
                 self.store.record_berth_state(berth, descr, bool(descr), ts, msg_type)
                 self._check_missing_topology(ts, descr, berth, berth, msg)
             return
@@ -1302,7 +1366,16 @@ class Learner:
         if not from_berth or not to_berth:
             return
 
+        if self._is_stale_berth_message(ts, from_berth, to_berth):
+            if self.print_c:
+                print(
+                    f"[C-SKIP-STALE] {fmt_ts(ts)} {msg_type} {from_berth}->{to_berth} "
+                    f"newer_from={fmt_ts(self.berth_ts.get(from_berth))} newer_to={fmt_ts(self.berth_ts.get(to_berth))}"
+                )
+            return
+
         # CA means the description moved from one berth to another.
+        self._mark_berth_ts(ts, from_berth, to_berth)
         self.store.record_berth_state(from_berth, "", False, ts, msg_type)
         self.store.record_berth_state(to_berth, descr, True, ts, msg_type)
 

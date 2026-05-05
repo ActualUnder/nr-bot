@@ -365,13 +365,43 @@ def known_desc_for_key(known: learner_mod.KnownBits, address: int, bit: int) -> 
 
 
 def current_bit_value(conn: sqlite3.Connection, key: learner_mod.BitKey) -> tuple[int | None, float | None, str | None]:
+    """Return the safest current value for one S-Class bit.
+
+    s_bytes is the latest byte snapshot table, but older bot versions could let
+    an out-of-order S-Class snapshot overwrite a newer byte. When raw bit-event
+    history has a newer event for this exact bit, prefer that event so /bit and
+    /signal do not report impossible stale states.
+    """
     row = conn.execute(
         "SELECT value, updated_ts, msg_type FROM s_bytes WHERE area=? AND address=?",
         (CFG.nr_area, int(key.address, 16)),
     ).fetchone()
-    if not row:
-        return None, None, None
-    return 1 if int(row["value"]) & (1 << key.bit) else 0, float(row["updated_ts"]), row["msg_type"]
+
+    current_value: int | None = None
+    current_ts: float | None = None
+    current_msg: str | None = None
+    if row:
+        current_value = 1 if int(row["value"]) & (1 << key.bit) else 0
+        current_ts = float(row["updated_ts"])
+        current_msg = row["msg_type"]
+
+    if table_exists(conn, "s_bit_events"):
+        latest = conn.execute(
+            """
+            SELECT event_ts, new_bit, msg_type
+            FROM s_bit_events
+            WHERE area=? AND address=? AND bit=?
+            ORDER BY event_ts DESC
+            LIMIT 1
+            """,
+            (CFG.nr_area, int(key.address, 16), int(key.bit)),
+        ).fetchone()
+        if latest:
+            event_ts = float(latest["event_ts"])
+            if current_ts is None or event_ts > current_ts + 0.001:
+                return int(latest["new_bit"]), event_ts, f"{latest['msg_type'] or '?'} raw-history"
+
+    return current_value, current_ts, current_msg
 
 
 def _active_state_text(active_state: str, raw_value: int) -> str | None:
@@ -854,12 +884,35 @@ async def nr_restart_cmd(interaction: discord.Interaction) -> None:
 
 
 @bot.tree.command(name="report", description="Show learner evidence report for a signal.")
-@app_commands.describe(signal="Signal/berth, e.g. 6232", show_known="Audit known CSV bits too")
-async def report_cmd(interaction: discord.Interaction, signal: str, show_known: bool = True) -> None:
+@app_commands.describe(
+    signal="Signal/berth, e.g. 6232",
+    show_known="Audit this signal's known CSV bits",
+    show_cross_known="Also show known bits belonging to other signals in the pass window",
+    min_pass_count="Minimum supporting pass hits to show a candidate",
+    min_pct="Minimum consistency percent, e.g. 80",
+    max_avg_delta="Maximum average timing delta in seconds; 0 disables this filter",
+)
+async def report_cmd(
+    interaction: discord.Interaction,
+    signal: str,
+    show_known: bool = True,
+    show_cross_known: bool = False,
+    min_pass_count: int = 3,
+    min_pct: float = 80.0,
+    max_avg_delta: float = 3.0,
+) -> None:
     await interaction.response.defer()
-    args = cli_args("report") + ["--signals", signal]
+    args = cli_args("report") + [
+        "--signals", signal,
+        "--min-pass-count", str(max(1, int(min_pass_count))),
+        "--min-pct", str(float(min_pct)),
+    ]
+    if float(max_avg_delta) > 0:
+        args += ["--max-avg-delta", str(float(max_avg_delta))]
     if show_known:
         args.append("--show-known")
+    if show_cross_known:
+        args.append("--show-cross-known")
     try:
         text = await run_cli_async(args)
     except Exception as exc:
