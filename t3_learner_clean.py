@@ -1271,6 +1271,27 @@ class Learner:
         if self.print_c and msg_type != "CT":
             print(f"[C] {fmt_ts(ts)} {msg_type} {msg}")
 
+        # Keep the latest berth/headcode state from all normal TD berth events,
+        # not just CA step messages. Without this, a train that is interposed
+        # directly into a berth (CC) or cancelled from a berth (CB) will never be
+        # reflected in /signal until a later CA happens. That was the main reason
+        # some berths appeared permanently clear or stale in Discord.
+        if msg_type == "CB":
+            berth = normalize_berth(msg.get("from") or msg.get("to") or msg.get("berth") or msg.get("address") or "")
+            descr = str(msg.get("descr", "") or "").strip()
+            if berth:
+                self.store.record_berth_state(berth, "", False, ts, msg_type)
+                self._check_missing_topology(ts, descr, berth, berth, msg)
+            return
+
+        if msg_type == "CC":
+            berth = normalize_berth(msg.get("to") or msg.get("from") or msg.get("berth") or msg.get("address") or "")
+            descr = str(msg.get("descr", "") or "").strip()
+            if berth:
+                self.store.record_berth_state(berth, descr, bool(descr), ts, msg_type)
+                self._check_missing_topology(ts, descr, berth, berth, msg)
+            return
+
         if msg_type != "CA":
             return
 
@@ -1281,7 +1302,6 @@ class Learner:
         if not from_berth or not to_berth:
             return
 
-        # Latest simple berth occupancy/headcode state for Discord /signal.
         # CA means the description moved from one berth to another.
         self.store.record_berth_state(from_berth, "", False, ts, msg_type)
         self.store.record_berth_state(to_berth, descr, True, ts, msg_type)
