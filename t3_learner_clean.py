@@ -59,6 +59,12 @@ except ImportError:
     stomp = None  # type: ignore
 
 
+# All user-facing and diagnostic timestamps are shown in the local railway
+# timezone.  This constant used to exist only in bot.py, which meant any live
+# C-Class message reaching fmt_ts() in the learner raised NameError.
+UK_TIMEZONE = ZoneInfo("Europe/London")
+
+
 # =============================================================================
 # Topology
 # =============================================================================

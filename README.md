@@ -1,5 +1,12 @@
 # Metro T3 Network Rail Protocol Bot
 
+## July 2026 command and timezone hotfix
+
+- Fixed the live `NameError: UK_TIMEZONE is not defined` raised when a C-Class berth step was formatted by the learner.
+- Fixed `/status` so the full NR Feed section is shown even before the first completed connection.
+- Replaced the large flat slash-command list with grouped commands and added `/help`.
+- Existing SQLite data and known_bits.csv files remain compatible.
+
 Discord bot and offline learner for the Network Rail T3 Train Describer feed.
 
 This version replaces the old “a bit changed near a train pass, therefore it is the signal aspect” logic with a protocol-level model of C-Class and S-Class messages.
@@ -30,7 +37,7 @@ The previous bug that discarded the four data bytes contained in `SH` has been r
 
 ### A persisted database is not automatically “live”
 
-After every startup or connection gap, the S-Class snapshot is invalidated. `/signal`, `/bit`, and `/observe_signal` withhold current raw state until a complete `SG ... SH` refresh has arrived.
+After every startup or connection gap, the S-Class snapshot is invalidated. `/signal show`, `/raw bit`, and `/signal observe` withhold current raw state until a complete `SG ... SH` refresh has arrived.
 
 The first `SF` received for an address before a refresh establishes a baseline. It does not create a fake edge from an old persisted byte.
 
@@ -81,7 +88,7 @@ A bit is classified as a `movement_pulse` when it normally:
 2. reverses shortly afterwards; and
 3. repeats this pattern on a large proportion of movements.
 
-That matches the observed `24:7` behaviour at 6239: it did not change when the physical signal cleared, then went `0 -> 1` at the 6239-to-6243 berth step and returned after roughly 18 seconds. `/signal 6239` therefore reports it as a rejected track/step/release-shaped mapping, not as the aspect.
+That matches the observed `24:7` behaviour at 6239: it did not change when the physical signal cleared, then went `0 -> 1` at the 6239-to-6243 berth step and returned after roughly 18 seconds. `/signal show signal:6239` therefore reports it as a rejected track/step/release-shaped mapping, not as the aspect.
 
 A bit which changes before the berth step and restores later can be classified as a `pre_step_control`, but it is still described as **signal OR route**. S-Class timing alone cannot safely distinguish a signal indication from a route indication.
 
@@ -90,9 +97,9 @@ A bit which changes before the berth step and restores later can be classified a
 Use one session per approach:
 
 ```text
-/observe_signal signal:6239 state:red headcode:2T10
-/observe_signal signal:6239 state:off
-/observe_signal signal:6239 state:post_pass
+/signal observe signal:6239 state:red headcode:2T10
+/signal observe signal:6239 state:off
+/signal observe signal:6239 state:post_pass
 ```
 
 - `red` starts a new session and captures the complete live snapshot.
@@ -103,26 +110,44 @@ Use one session per approach:
 Use:
 
 ```text
-/observations signal:6239
+/signal observations signal:6239
 ```
 
 A candidate is not shown until it has at least two consistent paired RED/OFF sessions. It is still not automatically promoted to a verified live mapping.
 
 ## Main Discord commands
 
-- `/status` — connection status, refresh generation, snapshot validity, rejected/duplicate message counts.
-- `/signal` — berth state, recent canonical steps, mapping provenance, rejected movement pulses, cautious pre-step controls, and physical observations.
-- `/bit` — current raw state only when the snapshot is valid, latest precisely timed SF edge, provenance, and protocol classification.
-- `/report` — detailed protocol evidence report for one signal/berth.
-- `/progress` — protocol ingestion and database summary.
-- `/observe_signal` — capture RED/OFF/post-pass snapshots.
-- `/observations` — review paired physical evidence.
-- `/moves` — canonical C-Class berth-step history; optional legacy +/- window attachments are clearly marked diagnostic only.
-- `/recent_bits` — recent raw timed S-Class edges.
-- `/known` — current CSV mappings and provenance.
-- `/download`, `/upload`, `/db_stats`, `/db_optimise` — data administration.
+The old flat list has been replaced with a small command hierarchy. Use `/help` in Discord for the same guide.
 
-The older `/bit_trace`, `/bit_correlate`, and `/route_bits` commands remain available as exploratory diagnostics. Their timing correlations are not proof of a physical signal aspect.
+### Everyday
+
+- `/status` — connection, refresh and database health.
+- `/signal show signal:6239` — berth state plus verified/cautious signal evidence.
+- `/td berths` — current stored berth/headcode states.
+- `/td moves signal:6239` — recent canonical C-Class berth movements.
+
+### Signal mapping
+
+- `/signal observe` — capture RED, OFF and post-pass snapshots.
+- `/signal observations` — review paired physical evidence.
+- `/signal analyse` — detailed protocol candidate report.
+- `/signal mappings` — known_bits.csv mappings, provenance and verification.
+- `/signal routes` — route-specific pre-step controls without calling them aspects.
+
+### Feed and diagnostics
+
+- `/feed start`, `/feed stop`, `/feed restart` — control the live NR connection.
+- `/diagnostics progress`, `/diagnostics check`, `/diagnostics missing` — ingestion, configuration and topology checks.
+- `/raw bit`, `/raw recent`, `/raw trace`, `/raw correlate`, `/raw bytes` — low-level S-Class tools.
+
+### Database
+
+- `/database stats` — file size and row counts.
+- `/database optimise` — ANALYZE/optimize, optional purge and VACUUM.
+- `/database export` — export the SQLite database, mappings and topology files.
+- `/database import` — import a supported database, CSV or ZIP backup.
+
+The raw correlation commands are exploratory diagnostics only. Their timing correlations are not proof of a physical signal aspect.
 
 ## Database migration
 
