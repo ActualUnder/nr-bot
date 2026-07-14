@@ -223,7 +223,7 @@ def ensure_dirs() -> None:
 def trim(text: str, limit: int = 1900) -> str:
     if len(text) <= limit:
         return text
-    return text[: limit - 90] + "\n\n...output trimmed. Use /download for full files."
+    return text[: limit - 90] + "\n\n...output trimmed. Use /database export for full files."
 
 
 def split_text(text: str, limit: int = 1900) -> list[str]:
@@ -1199,6 +1199,35 @@ NR_SERVICE = NRFeedService()
 
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+feed_group = app_commands.Group(
+    name="feed",
+    description="Start, stop and restart the live Network Rail feed.",
+)
+signal_group = app_commands.Group(
+    name="signal",
+    description="Inspect, analyse and physically verify a signal or TD berth.",
+)
+td_group = app_commands.Group(
+    name="td",
+    description="Inspect Train Describer berth and headcode movements.",
+)
+raw_group = app_commands.Group(
+    name="raw",
+    description="Low-level S-Class byte and bit diagnostics.",
+)
+diagnostics_group = app_commands.Group(
+    name="diagnostics",
+    description="Protocol health, topology and learner diagnostics.",
+)
+database_group = app_commands.Group(
+    name="database",
+    description="Database maintenance, import and export tools.",
+)
+
+_COMMAND_GROUPS = (
+    feed_group, signal_group, td_group, raw_group, diagnostics_group, database_group
+)
 _READY_DONE = False
 
 
@@ -1256,6 +1285,9 @@ async def status_cmd(interaction: discord.Interaction) -> None:
         ),
         inline=False,
     )
+    duration_text = (
+        f"{nr_last_duration:.0f}s" if nr_last_duration is not None else "n/a"
+    )
     embed.add_field(
         name="NR Feed",
         value=(
@@ -1265,7 +1297,7 @@ async def status_cmd(interaction: discord.Interaction) -> None:
             f"Messages: `{nr_messages}`\n"
             f"Last message: `{fmt_ts(nr_last_message_ts)}`\n"
             f"Last connect: `{fmt_ts(nr_last_connect_ts)}`\n"
-            f"Last connected duration: `{nr_last_duration:.0f}s`" if nr_last_duration else "Last connected duration: `n/a`"
+            f"Last connected duration: `{duration_text}`"
         ),
         inline=False,
     )
@@ -1300,19 +1332,62 @@ async def status_cmd(interaction: discord.Interaction) -> None:
     await interaction.response.send_message(embed=embed)
 
 
-@bot.tree.command(name="nr_start", description="Start the live Network Rail TD feed learner.")
+@bot.tree.command(name="help", description="Show the simplified NR Bot command layout and examples.")
+async def help_cmd(interaction: discord.Interaction) -> None:
+    embed = discord.Embed(
+        title="NR Bot commands",
+        description=(
+            "Commands are grouped by purpose. Start with `/status` and `/signal show`. "
+            "The low-level raw tools are mainly for mapping and fault-finding."
+        ),
+        color=0x3498DB,
+    )
+    embed.add_field(
+        name="Everyday",
+        value=(
+            "`/status` — feed and snapshot health\n"
+            "`/signal show signal:6239` — current berth and verified signal evidence\n"
+            "`/td berths` — occupied TD berths/headcodes\n"
+            "`/td moves signal:6239` — recent berth movements"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Signal mapping",
+        value=(
+            "`/signal observe` — capture RED, OFF and post-pass states\n"
+            "`/signal observations` — review physical evidence\n"
+            "`/signal analyse` — detailed candidate analysis\n"
+            "`/signal mappings` and `/signal routes` — reference/route evidence"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Operations and diagnostics",
+        value=(
+            "`/feed start|stop|restart` — control the NR connection\n"
+            "`/diagnostics progress|check|missing` — health and topology checks\n"
+            "`/raw bit|recent|trace|correlate|bytes` — low-level S-Class tools\n"
+            "`/database stats|optimise|export|import` — data maintenance"
+        ),
+        inline=False,
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@feed_group.command(name="start", description="Start the live Network Rail TD feed.")
 async def nr_start_cmd(interaction: discord.Interaction) -> None:
     await interaction.response.defer()
     await send_text(interaction, await asyncio.to_thread(NR_SERVICE.start))
 
 
-@bot.tree.command(name="nr_stop", description="Stop the live Network Rail TD feed learner.")
+@feed_group.command(name="stop", description="Stop the live Network Rail TD feed.")
 async def nr_stop_cmd(interaction: discord.Interaction) -> None:
     await interaction.response.defer()
     await send_text(interaction, await asyncio.to_thread(NR_SERVICE.stop, join=True))
 
 
-@bot.tree.command(name="nr_restart", description="Restart the live Network Rail TD feed learner.")
+@feed_group.command(name="restart", description="Restart the live Network Rail TD feed.")
 async def nr_restart_cmd(interaction: discord.Interaction) -> None:
     await interaction.response.defer()
     stopped = await asyncio.to_thread(NR_SERVICE.stop, join=True)
@@ -1322,7 +1397,7 @@ async def nr_restart_cmd(interaction: discord.Interaction) -> None:
     await send_text(interaction, stopped + "\n" + started)
 
 
-@bot.tree.command(name="report", description="Show protocol-level S-Class evidence for a signal/berth.")
+@signal_group.command(name="analyse", description="Analyse protocol evidence and candidate bits for a signal.")
 @app_commands.describe(
     signal="Signal/berth, e.g. 6239",
     max_steps="Maximum recent canonical CA berth steps to analyse",
@@ -1400,7 +1475,7 @@ async def report_cmd(
         await send_text(interaction, f"Error: {exc}")
 
 
-@bot.tree.command(name="progress", description="Show protocol ingestion, snapshot and observation progress.")
+@diagnostics_group.command(name="progress", description="Show protocol ingestion and learner progress.")
 async def progress_cmd(interaction: discord.Interaction) -> None:
     await interaction.response.defer()
     try:
@@ -1465,7 +1540,7 @@ async def progress_cmd(interaction: discord.Interaction) -> None:
         await send_text(interaction, f"Error: {exc}")
 
 
-@bot.tree.command(name="known", description="Show known_bits.csv mappings for a signal.")
+@signal_group.command(name="mappings", description="Show CSV mappings, provenance and verification for a signal.")
 async def known_cmd(interaction: discord.Interaction, signal: str) -> None:
     await interaction.response.defer()
     try:
@@ -1475,7 +1550,7 @@ async def known_cmd(interaction: discord.Interaction, signal: str) -> None:
     await send_text(interaction, text, paged=True)
 
 
-@bot.tree.command(name="moves", description="Show learned movements involving a signal/berth.")
+@td_group.command(name="moves", description="Show canonical berth movements involving a signal or berth.")
 @app_commands.describe(
     signal="Signal/berth to inspect, e.g. 6244",
     limit="Maximum rows to show",
@@ -1500,7 +1575,7 @@ async def moves_cmd(
     await send_text(interaction, text, paged=True)
 
 
-@bot.tree.command(name="berths", description="Show stored TD berth/headcode states.")
+@td_group.command(name="berths", description="Show current stored TD berth and headcode states.")
 @app_commands.describe(
     berth="Optional exact berth or prefix, e.g. 6263 or 62",
     occupied_only="Only show occupied berths",
@@ -1559,7 +1634,7 @@ async def berths_cmd(
         await send_text(interaction, f"Error: {exc}")
 
 
-@bot.tree.command(name="bytes", description="Show S-Class byte addresses seen by the learner.")
+@raw_group.command(name="bytes", description="Show S-Class byte addresses seen by the learner.")
 async def bytes_cmd(interaction: discord.Interaction) -> None:
     await interaction.response.defer()
     try:
@@ -1569,7 +1644,7 @@ async def bytes_cmd(interaction: discord.Interaction) -> None:
     await send_text(interaction, text, paged=True)
 
 
-@bot.tree.command(name="missing", description="Show missing topology observations.")
+@diagnostics_group.command(name="missing", description="Show berth movements missing from configured topology.")
 async def missing_cmd(interaction: discord.Interaction) -> None:
     await interaction.response.defer()
     try:
@@ -1579,7 +1654,7 @@ async def missing_cmd(interaction: discord.Interaction) -> None:
     await send_text(interaction, text, paged=True)
 
 
-@bot.tree.command(name="check", description="Check topology, known CSV and database load.")
+@diagnostics_group.command(name="check", description="Check topology, known CSV and database loading.")
 async def check_cmd(interaction: discord.Interaction) -> None:
     await interaction.response.defer()
     try:
@@ -1589,7 +1664,7 @@ async def check_cmd(interaction: discord.Interaction) -> None:
     await send_text(interaction, text, paged=True)
 
 
-@bot.tree.command(name="bit", description="Show raw S-Class bit state, provenance and protocol classification.")
+@raw_group.command(name="bit", description="Show one raw S-Class bit, provenance and classification.")
 async def bit_cmd(interaction: discord.Interaction, bit: str) -> None:
     await interaction.response.defer()
     try:
@@ -1684,7 +1759,7 @@ async def bit_cmd(interaction: discord.Interaction, bit: str) -> None:
         await send_text(interaction, f"Error: {exc}")
 
 
-@bot.tree.command(name="signal", description="Show TD berth state and cautious protocol-level S-Class evidence.")
+@signal_group.command(name="show", description="Show berth state and cautious evidence for a signal.")
 async def signal_cmd(interaction: discord.Interaction, signal: str) -> None:
     await interaction.response.defer()
     try:
@@ -1851,7 +1926,7 @@ async def signal_cmd(interaction: discord.Interaction, signal: str) -> None:
                 )
             else:
                 lines.append(
-                    "Physical observations: none/insufficient. Use /observe_signal with red, off and post_pass during the same approach."
+                    "Physical observations: none/insufficient. Use /signal observe with red, off and post_pass during the same approach."
                 )
 
         await send_text(interaction, "\n".join(lines), paged=True)
@@ -1859,7 +1934,7 @@ async def signal_cmd(interaction: discord.Interaction, signal: str) -> None:
         await send_text(interaction, f"Error: {exc}")
 
 
-@bot.tree.command(name="observe_signal", description="Capture a paired physical signal observation against the live S-Class snapshot.")
+@signal_group.command(name="observe", description="Capture a physical RED, OFF or post-pass observation.")
 @app_commands.describe(
     signal="Signal/berth, e.g. 6239",
     state="Use red, off, post_pass or cancel",
@@ -1958,7 +2033,7 @@ async def observe_signal_cmd(
         await send_text(interaction, f"Error: {exc}")
 
 
-@bot.tree.command(name="observations", description="Show paired RED/OFF physical observation evidence for a signal.")
+@signal_group.command(name="observations", description="Review paired physical observations for a signal.")
 async def observations_cmd(interaction: discord.Interaction, signal: str) -> None:
     await interaction.response.defer()
     sig = learner_mod.normalize_berth(signal)
@@ -1985,7 +2060,7 @@ async def observations_cmd(interaction: discord.Interaction, signal: str) -> Non
 
         lines = [f"Physical observation evidence for {sig}"]
         if not sessions:
-            lines.append("No sessions yet. Use /observe_signal state:red during an approach.")
+            lines.append("No sessions yet. Use /signal observe state:red during an approach.")
         else:
             lines.append(f"Sessions: {len(sessions)} shown")
             for row in sessions[:8]:
@@ -2008,7 +2083,7 @@ async def observations_cmd(interaction: discord.Interaction, signal: str) -> Non
         await send_text(interaction, f"Error: {exc}")
 
 
-@bot.tree.command(name="recent_bits", description="Show recent precisely timed SF bit changes.")
+@raw_group.command(name="recent", description="Show recent precisely timed SF bit changes.")
 @app_commands.describe(
     signal="Optional signal to filter by known_bits.csv mapping, e.g. 6244",
     bit="Optional byte:bit filter, e.g. 25:3",
@@ -2106,7 +2181,7 @@ async def recent_bits_cmd(
 
 
 
-@bot.tree.command(name="bit_correlate", description="Exploratory SF-edge correlation with canonical CA berth steps.")
+@raw_group.command(name="correlate", description="Correlate one SF bit with canonical CA berth steps.")
 @app_commands.describe(
     bit="Byte:bit filter, e.g. 25:3",
     since_minutes="Only analyse bit changes newer than this many minutes",
@@ -2175,7 +2250,7 @@ async def bit_correlate_cmd(
         await send_text(interaction, f"Error: {exc}")
 
 
-@bot.tree.command(name="bit_trace", description="Compare precisely timed SF edges with canonical CA berth steps.")
+@raw_group.command(name="trace", description="Trace one SF bit against canonical CA berth steps.")
 @app_commands.describe(
     bit="Byte:bit filter, e.g. 25:3",
     signal="Signal/berth to compare against, e.g. 6244. Defaults to known_bits.csv mapping if unique.",
@@ -2267,7 +2342,7 @@ async def bit_trace_cmd(
         await send_text(interaction, f"Error: {exc}")
 
 
-@bot.tree.command(name="route_bits", description="Show route-specific pre-step controls without calling them signal aspects.")
+@signal_group.command(name="routes", description="Show route-specific pre-step controls for a signal.")
 @app_commands.describe(
     signal="From berth/signal, e.g. 6248",
     to="Optional exact next berth/route, e.g. 6244",
@@ -2327,7 +2402,7 @@ async def route_bits_cmd(
         await send_text(interaction, f"Error: {exc}")
 
 
-@bot.tree.command(name="db_stats", description="Show SQLite database size, row counts and useful runtime stats.")
+@database_group.command(name="stats", description="Show database size, row counts and runtime statistics.")
 async def db_stats_cmd(interaction: discord.Interaction) -> None:
     await interaction.response.defer()
     try:
@@ -2412,7 +2487,7 @@ def optimise_database(*, purge_days: Optional[int], vacuum: bool) -> str:
     return "\n".join(lines)
 
 
-@bot.tree.command(name="db_optimise", description="Run SQLite ANALYZE/optimize, optional purge, and optional VACUUM.")
+@database_group.command(name="optimise", description="Optimise, optionally purge, and compact the database.")
 @app_commands.describe(
     purge_days="Optional: delete raw/history rows older than this many days before vacuuming",
     vacuum="Compact the DB file after optimisation/purge",
@@ -2472,7 +2547,7 @@ def make_download_zip() -> Path:
     return out
 
 
-@bot.tree.command(name="download", description="Download known_bits.csv, SQLite DB and missing topology files as one zip.")
+@database_group.command(name="export", description="Export the database, mappings and topology evidence as a ZIP.")
 async def download_cmd(interaction: discord.Interaction) -> None:
     await interaction.response.defer()
     out = await asyncio.to_thread(make_download_zip)
@@ -2556,7 +2631,7 @@ def apply_upload(path: Path) -> list[str]:
     raise RuntimeError("Unsupported upload. Use known_bits.csv, .sqlite/.db, or a .zip containing them.")
 
 
-@bot.tree.command(name="upload", description="Upload known_bits.csv, SQLite DB, or a zip containing both.")
+@database_group.command(name="import", description="Import mappings, a database, or a supported ZIP backup.")
 async def upload_cmd(interaction: discord.Interaction, attachment: discord.Attachment) -> None:
     await interaction.response.defer()
     ensure_dirs()
@@ -2579,6 +2654,10 @@ async def upload_cmd(interaction: discord.Interaction, attachment: discord.Attac
         if was_running:
             await asyncio.to_thread(NR_SERVICE.start)
         await send_text(interaction, f"Upload failed: {exc}")
+
+
+for _group in _COMMAND_GROUPS:
+    bot.tree.add_command(_group)
 
 
 def main() -> None:
