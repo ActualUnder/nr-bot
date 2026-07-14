@@ -32,21 +32,26 @@ Known bits check:
 from __future__ import annotations
 
 import argparse
+import bisect
 import collections
+import contextlib
 import csv
 import dataclasses
 import datetime as dt
+import hashlib
 import json
 import os
 import re
 import signal as signal_module
 import sqlite3
+import statistics
 import sys
 import threading
 import time
 import traceback
 from pathlib import Path
 from typing import Any, Deque, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from zoneinfo import ZoneInfo
 
 try:
     import stomp  # type: ignore
@@ -276,10 +281,25 @@ class KnownBit:
     ignore: bool = True
     confidence: str = ""
     notes: str = ""
+    provenance: str = "reference-unverified"
+    verified: bool = False
+    element_group: str = ""
 
     @property
     def described(self) -> bool:
         return bool((self.description or "").strip())
+
+    @property
+    def trusted_for_live_aspect(self) -> bool:
+        """Only verified physical/as-built mappings may drive RED/OFF output."""
+        source = (self.provenance or "").strip().lower().replace("_", "-")
+        element_type = (self.element_type or "").strip().lower()
+        element_group = (self.element_group or "").strip().upper()
+        is_signal_indication = element_type in {"signal", "signal aspect", "aspect"} or element_group == "SIG"
+        return bool(self.verified and is_signal_indication and source in {
+            "sop", "ecs", "authoritative", "as-built", "physical-observation",
+            "physically-observed", "manual-verified",
+        })
 
     def summary(self) -> str:
         parts = [self.element_type or "Known", self.description or "(blank description)"]
@@ -289,6 +309,10 @@ class KnownBit:
             parts.append(f"route={self.route_from}->{self.route_to}")
         if self.active_state:
             parts.append(f"active={self.active_state}")
+        parts.append(f"source={self.provenance or 'reference-unverified'}")
+        parts.append(f"verified={'yes' if self.verified else 'no'}")
+        if self.element_group:
+            parts.append(f"group={self.element_group}")
         if self.confidence:
             parts.append(f"conf={self.confidence}")
         return " | ".join(parts)
@@ -418,34 +442,89 @@ def load_known_bits(path: Path) -> KnownBits:
                 ignore=truthy(row_get(row, "Ignore In Tracker", "Ignore In Learner", "Ignore", "ignore_in_tracker"), True),
                 confidence=row_get(row, "Confidence", "Conf"),
                 notes=row_get(row, "Notes", "Note"),
+                provenance=row_get(row, "Provenance", "Source", "Mapping Source", "provenance") or "reference-unverified",
+                verified=truthy(row_get(row, "Verified", "Live Verified", "verified"), False),
+                element_group=row_get(row, "Element Group", "Group", "S-Class Group", "element_group"),
             ))
     return KnownBits(rows)
 
 
+class InvalidTDMessage(ValueError):
+    """A malformed TD payload which must not be converted into fake live evidence."""
+
+
 def parse_nr_time_ms(value: Any) -> float:
-    try:
-        return int(value) / 1000.0
-    except Exception:
-        return time.time()
+    """Parse Network Rail millisecond epoch timestamps strictly.
+
+    Older code substituted ``time.time()`` for malformed timestamps. That made a
+    corrupt message look perfectly correlated with whatever berth step happened
+    at the same moment. Invalid timestamps are now rejected instead.
+    """
+    if value is None or isinstance(value, bool):
+        raise InvalidTDMessage("missing TD time")
+    text = str(value).strip()
+    if not text or not re.fullmatch(r"[0-9]{10,16}", text):
+        raise InvalidTDMessage(f"invalid TD time {value!r}")
+    ts = int(text) / 1000.0
+    now = time.time()
+
+    # The TD platform has a documented edge case around UTC midnight where a
+    # tiny number of events can be stamped on the adjacent date. Correct only
+    # the unmistakable +/-24 hour case when it brings the event close to now;
+    # historical/replayed data is otherwise left untouched.
+    utc_now = dt.datetime.fromtimestamp(now, dt.timezone.utc)
+    seconds_from_midnight = (
+        utc_now.hour * 3600 + utc_now.minute * 60 + utc_now.second
+    )
+    near_utc_midnight = seconds_from_midnight <= 120 or seconds_from_midnight >= 86400 - 120
+    if near_utc_midnight and abs(ts - now) > 23 * 3600:
+        for candidate in (ts - 86400.0, ts + 86400.0):
+            if abs(candidate - now) <= 120.0:
+                ts = candidate
+                break
+
+    # Broad sanity range: 2000-01-01 through ten minutes in the future. The
+    # future allowance covers clock skew without accepting nonsensical epochs.
+    if ts < 946684800 or ts > now + 600:
+        raise InvalidTDMessage(f"TD time outside sane range: {value!r}")
+    return ts
 
 
 def fmt_ts(ts: float) -> str:
-    return dt.datetime.fromtimestamp(float(ts)).strftime("%Y-%m-%d %H:%M:%S")
+    return dt.datetime.fromtimestamp(float(ts), UK_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
 def iso_ts(ts: float) -> str:
-    return dt.datetime.fromtimestamp(float(ts)).isoformat(timespec="seconds")
+    return dt.datetime.fromtimestamp(float(ts), UK_TIMEZONE).isoformat(timespec="seconds")
 
 
-def split_hex_bytes(data: Any) -> List[int]:
-    s = str(data or "").strip().replace(" ", "")
+def split_hex_bytes(data: Any, *, expected_bytes: Optional[int] = None) -> List[int]:
+    """Decode an S-Class hex payload without silently repairing bad data."""
+    s = str(data or "").strip().replace(" ", "").upper()
+    if not s:
+        raise InvalidTDMessage("empty S-Class data")
     if len(s) % 2:
-        s = "0" + s
-    return [int(s[i:i + 2], 16) for i in range(0, len(s), 2)]
+        raise InvalidTDMessage(f"odd-length S-Class data {s!r}")
+    if not re.fullmatch(r"[0-9A-F]+", s):
+        raise InvalidTDMessage(f"non-hex S-Class data {s!r}")
+    values = [int(s[i:i + 2], 16) for i in range(0, len(s), 2)]
+    if expected_bytes is not None and len(values) != int(expected_bytes):
+        raise InvalidTDMessage(
+            f"expected {expected_bytes} S-Class byte(s), received {len(values)}: {s!r}"
+        )
+    return values
 
 
 def parse_hex_address(address: Any) -> int:
-    return int(str(address).strip().upper(), 16)
+    text = str(address or "").strip().upper()
+    if text.startswith("0X"):
+        text = text[2:]
+    if not re.fullmatch(r"[0-9A-F]{1,2}", text):
+        raise InvalidTDMessage(f"invalid S-Class address {address!r}")
+    value = int(text, 16)
+    if not 0 <= value <= 0xFF:
+        raise InvalidTDMessage(f"S-Class address out of range {address!r}")
+    return value
 
 
 def bit_value(byte: int, bit: int) -> int:
@@ -453,21 +532,44 @@ def bit_value(byte: int, bit: int) -> int:
 
 
 def iter_message_objects(body: str) -> Iterable[Tuple[str, Dict[str, Any]]]:
+    """Parse one TD STOMP frame into its inner messages.
+
+    A malformed frame is raised to the listener instead of being mistaken for
+    an empty successful frame. The listener records and acknowledges malformed
+    poison frames, while genuine processing/database failures remain
+    unacknowledged for durable redelivery.
+    """
     try:
         parsed = json.loads(body)
-    except json.JSONDecodeError:
-        return
-    items = [parsed] if isinstance(parsed, dict) else parsed if isinstance(parsed, list) else []
-    for item in items:
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise InvalidTDMessage(f"invalid STOMP JSON: {exc}") from exc
+
+    if isinstance(parsed, dict):
+        items = [parsed]
+    elif isinstance(parsed, list):
+        items = parsed
+    else:
+        raise InvalidTDMessage(f"TD frame root must be object or list, got {type(parsed).__name__}")
+
+    output: List[Tuple[str, Dict[str, Any]]] = []
+    for index, item in enumerate(items):
         if not isinstance(item, dict):
-            continue
+            raise InvalidTDMessage(f"TD frame item {index} is not an object")
         if len(item) == 1:
             key, payload = next(iter(item.items()))
-            if isinstance(payload, dict):
-                yield str(key), payload
-        elif item.get("msg_type"):
+            if not isinstance(payload, dict):
+                raise InvalidTDMessage(f"TD frame item {index} payload is not an object")
+            output.append((str(key), payload))
+            continue
+        if item.get("msg_type"):
             msg_type = str(item["msg_type"])
-            yield (msg_type if msg_type.endswith("_MSG") else f"{msg_type}_MSG"), item
+            output.append((msg_type if msg_type.endswith("_MSG") else f"{msg_type}_MSG", item))
+            continue
+        raise InvalidTDMessage(f"TD frame item {index} has no recognised message wrapper")
+
+    if not output:
+        raise InvalidTDMessage("TD frame contained no messages")
+    return output
 
 
 # =============================================================================
@@ -550,8 +652,9 @@ class Store:
         with self.lock, self.conn:
             self.conn.executescript("""
                 PRAGMA busy_timeout=5000;
-                PRAGMA wal_checkpoint(TRUNCATE);
-                PRAGMA journal_mode=DELETE;
+                PRAGMA journal_mode=WAL;
+                PRAGMA synchronous=NORMAL;
+                PRAGMA foreign_keys=ON;
 
                 CREATE TABLE IF NOT EXISTS s_bytes (
                     area TEXT NOT NULL,
@@ -646,11 +749,123 @@ class Store:
                     PRIMARY KEY(area, from_berth, to_berth, reason)
                 );
 
+                -- Canonical protocol-level message ledger. The fingerprint makes
+                -- reconnect/re-delivery safe: the same TD message is processed once.
+                CREATE TABLE IF NOT EXISTS raw_td_messages (
+                    fingerprint TEXT PRIMARY KEY,
+                    received_ts REAL NOT NULL,
+                    event_ts REAL NOT NULL,
+                    area TEXT NOT NULL,
+                    msg_type TEXT NOT NULL,
+                    payload_json TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS feed_state (
+                    area TEXT PRIMARY KEY,
+                    snapshot_valid INTEGER NOT NULL DEFAULT 0,
+                    snapshot_generation INTEGER NOT NULL DEFAULT 0,
+                    refresh_in_progress INTEGER NOT NULL DEFAULT 0,
+                    refresh_started_ts REAL,
+                    last_complete_refresh_ts REAL,
+                    last_complete_refresh_received_ts REAL,
+                    last_s_event_ts REAL,
+                    last_c_event_ts REAL,
+                    last_connected_ts REAL,
+                    last_disconnected_ts REAL,
+                    invalid_messages INTEGER NOT NULL DEFAULT 0,
+                    duplicate_messages INTEGER NOT NULL DEFAULT 0,
+                    last_reason TEXT DEFAULT ''
+                );
+
+                CREATE TABLE IF NOT EXISTS refresh_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    area TEXT NOT NULL,
+                    started_event_ts REAL,
+                    completed_event_ts REAL,
+                    started_received_ts REAL NOT NULL,
+                    completed_received_ts REAL,
+                    byte_count INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL,
+                    reason TEXT DEFAULT ''
+                );
+
+                -- SG/SH refresh differences are observations, not accurately timed
+                -- state transitions. They are deliberately kept out of s_bit_events.
+                CREATE TABLE IF NOT EXISTS s_snapshot_differences (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    area TEXT NOT NULL,
+                    generation INTEGER NOT NULL,
+                    observed_ts REAL NOT NULL,
+                    address INTEGER NOT NULL,
+                    bit INTEGER NOT NULL,
+                    old_bit INTEGER,
+                    new_bit INTEGER NOT NULL,
+                    old_byte INTEGER,
+                    new_byte INTEGER NOT NULL,
+                    source_msg_type TEXT NOT NULL
+                );
+
+                -- Canonical name for C-Class CA events. A CA is a berth step, not
+                -- proof of the precise physical signal-passage time.
+                CREATE TABLE IF NOT EXISTS berth_steps (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    area TEXT NOT NULL,
+                    event_ts REAL NOT NULL,
+                    descr TEXT,
+                    from_berth TEXT NOT NULL,
+                    to_berth TEXT NOT NULL,
+                    source_msg_type TEXT NOT NULL DEFAULT 'CA',
+                    topology_valid INTEGER NOT NULL DEFAULT 0,
+                    special_reason TEXT DEFAULT '',
+                    raw_json TEXT DEFAULT '',
+                    UNIQUE(area, event_ts, from_berth, to_berth, descr)
+                );
+
+                CREATE TABLE IF NOT EXISTS signal_observation_sessions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    signal TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'open',
+                    started_ts REAL NOT NULL,
+                    closed_ts REAL,
+                    descr TEXT DEFAULT '',
+                    notes TEXT DEFAULT ''
+                );
+
+                CREATE TABLE IF NOT EXISTS signal_observations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id INTEGER NOT NULL,
+                    signal TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    observed_ts REAL NOT NULL,
+                    snapshot_json TEXT NOT NULL,
+                    snapshot_generation INTEGER NOT NULL,
+                    notes TEXT DEFAULT '',
+                    FOREIGN KEY(session_id) REFERENCES signal_observation_sessions(id)
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_pbe_signal_time ON pass_bit_events(signal, event_ts);
                 CREATE INDEX IF NOT EXISTS idx_pbe_bit ON pass_bit_events(address, bit);
                 CREATE INDEX IF NOT EXISTS idx_sbe_bit_time ON s_bit_events(address, bit, event_ts);
+                CREATE INDEX IF NOT EXISTS idx_sbe_time ON s_bit_events(event_ts);
                 CREATE INDEX IF NOT EXISTS idx_pass_signal ON pass_log(signal, to_berth, finalised_ts);
+                CREATE INDEX IF NOT EXISTS idx_steps_from_time ON berth_steps(from_berth, event_ts);
+                CREATE INDEX IF NOT EXISTS idx_steps_time ON berth_steps(event_ts);
+                CREATE INDEX IF NOT EXISTS idx_snapshot_diff_generation ON s_snapshot_differences(area, generation);
+                CREATE INDEX IF NOT EXISTS idx_observation_signal ON signal_observations(signal, observed_ts);
                 CREATE INDEX IF NOT EXISTS idx_missing_last ON missing_topology_summary(last_ts);
+            """)
+
+            # Backfill the canonical berth-step table from legacy pass_log data.
+            # The old table is retained so existing reports/downloaded DBs continue
+            # to work, but new protocol analysis uses berth_steps.
+            self.conn.execute("""
+                INSERT OR IGNORE INTO berth_steps(
+                    area,event_ts,descr,from_berth,to_berth,source_msg_type,
+                    topology_valid,special_reason,raw_json
+                )
+                SELECT 'T3', pass_ts, descr, from_berth, to_berth, 'CA-legacy',
+                       0, COALESCE(special_reason,''), ''
+                FROM pass_log
             """)
 
     def load_bytes(self, area: str) -> Dict[int, int]:
@@ -692,6 +907,388 @@ class Store:
                 WHERE excluded.updated_ts >= s_bytes.updated_ts
             """, (area, address, value, msg_type, ts))
 
+    def record_raw_message(
+        self,
+        *,
+        area: str,
+        msg_type: str,
+        msg: Dict[str, Any],
+        event_ts: float,
+        received_ts: Optional[float] = None,
+    ) -> Tuple[bool, str]:
+        """Insert one canonical TD message and return ``(is_new, fingerprint)``."""
+        received = float(received_ts if received_ts is not None else time.time())
+        payload = json.dumps(msg, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        fingerprint = hashlib.sha256(
+            f"{area.upper()}|{msg_type.upper()}|{payload}".encode("utf-8")
+        ).hexdigest()
+        if getattr(self, "read_only", False):
+            return True, fingerprint
+        with self.lock, self.conn:
+            cur = self.conn.execute(
+                """
+                INSERT OR IGNORE INTO raw_td_messages(
+                    fingerprint,received_ts,event_ts,area,msg_type,payload_json
+                ) VALUES(?,?,?,?,?,?)
+                """,
+                (fingerprint, received, float(event_ts), area.upper(), msg_type.upper(), payload),
+            )
+            is_new = cur.rowcount > 0
+            self.conn.execute(
+                """
+                INSERT INTO feed_state(area, duplicate_messages)
+                VALUES(?,?)
+                ON CONFLICT(area) DO UPDATE SET
+                    duplicate_messages=feed_state.duplicate_messages + excluded.duplicate_messages
+                """,
+                (area.upper(), 0 if is_new else 1),
+            )
+        return is_new, fingerprint
+
+    def mark_invalid_message(self, area: str, reason: str) -> None:
+        if getattr(self, "read_only", False):
+            return
+        with self.lock, self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO feed_state(area, invalid_messages, last_reason)
+                VALUES(?,1,?)
+                ON CONFLICT(area) DO UPDATE SET
+                    invalid_messages=feed_state.invalid_messages+1,
+                    last_reason=excluded.last_reason
+                """,
+                (area.upper(), str(reason)[:500]),
+            )
+
+    def mark_connected(self, area: str, ts: Optional[float] = None) -> None:
+        if getattr(self, "read_only", False):
+            return
+        now = float(ts if ts is not None else time.time())
+        with self.lock, self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO feed_state(area,snapshot_valid,last_connected_ts,last_reason)
+                VALUES(?,0,?,'connected; waiting for complete SG...SH refresh')
+                ON CONFLICT(area) DO UPDATE SET
+                    snapshot_valid=0,
+                    refresh_in_progress=0,
+                    refresh_started_ts=NULL,
+                    last_connected_ts=excluded.last_connected_ts,
+                    last_reason=excluded.last_reason
+                """,
+                (area.upper(), now),
+            )
+
+    def mark_disconnected(self, area: str, reason: str = "feed disconnected") -> None:
+        if getattr(self, "read_only", False):
+            return
+        now = time.time()
+        with self.lock, self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO feed_state(area,snapshot_valid,last_disconnected_ts,last_reason)
+                VALUES(?,0,?,?)
+                ON CONFLICT(area) DO UPDATE SET
+                    snapshot_valid=0,
+                    refresh_in_progress=0,
+                    refresh_started_ts=NULL,
+                    last_disconnected_ts=excluded.last_disconnected_ts,
+                    last_reason=excluded.last_reason
+                """,
+                (area.upper(), now, str(reason)[:500]),
+            )
+
+    def begin_refresh(self, area: str, event_ts: float, received_ts: Optional[float] = None) -> int:
+        if getattr(self, "read_only", False):
+            return 0
+        received = float(received_ts if received_ts is not None else time.time())
+        with self.lock, self.conn:
+            cur = self.conn.execute(
+                """
+                INSERT INTO refresh_history(
+                    area,started_event_ts,started_received_ts,status,reason
+                ) VALUES(?,?,?,'in_progress','')
+                """,
+                (area.upper(), float(event_ts), received),
+            )
+            refresh_id = int(cur.lastrowid)
+            self.conn.execute(
+                """
+                INSERT INTO feed_state(area,snapshot_valid,refresh_in_progress,refresh_started_ts,last_reason)
+                VALUES(?,0,1,?,'S-Class refresh in progress')
+                ON CONFLICT(area) DO UPDATE SET
+                    snapshot_valid=0,
+                    refresh_in_progress=1,
+                    refresh_started_ts=excluded.refresh_started_ts,
+                    last_reason=excluded.last_reason
+                """,
+                (area.upper(), float(event_ts)),
+            )
+        return refresh_id
+
+    def abort_refresh(self, area: str, refresh_id: int, reason: str) -> None:
+        if getattr(self, "read_only", False):
+            return
+        with self.lock, self.conn:
+            if refresh_id:
+                self.conn.execute(
+                    """
+                    UPDATE refresh_history
+                    SET completed_received_ts=?, status='aborted', reason=?
+                    WHERE id=?
+                    """,
+                    (time.time(), str(reason)[:500], int(refresh_id)),
+                )
+            self.conn.execute(
+                """
+                INSERT INTO feed_state(area,snapshot_valid,refresh_in_progress,last_reason)
+                VALUES(?,0,0,?)
+                ON CONFLICT(area) DO UPDATE SET
+                    snapshot_valid=0,
+                    refresh_in_progress=0,
+                    refresh_started_ts=NULL,
+                    last_reason=excluded.last_reason
+                """,
+                (area.upper(), str(reason)[:500]),
+            )
+
+    def commit_refresh_snapshot(
+        self,
+        *,
+        area: str,
+        refresh_id: int,
+        staged: Dict[int, Tuple[int, float, str]],
+        completed_event_ts: float,
+        received_ts: Optional[float] = None,
+    ) -> Tuple[int, List[BitEvent]]:
+        """Atomically apply a complete SG...SH refresh.
+
+        Returned differences are observational only. They are stored in
+        ``s_snapshot_differences`` and intentionally never written to
+        ``s_bit_events`` because the exact transition time is unknown.
+        """
+        received = float(received_ts if received_ts is not None else time.time())
+        differences: List[BitEvent] = []
+        if getattr(self, "read_only", False):
+            return 0, differences
+        with self.lock, self.conn:
+            row = self.conn.execute(
+                "SELECT snapshot_generation FROM feed_state WHERE area=?",
+                (area.upper(),),
+            ).fetchone()
+            generation = int(row["snapshot_generation"] if row else 0) + 1
+
+            for address, (new_value, event_ts, source_msg_type) in sorted(staged.items()):
+                old = self.conn.execute(
+                    "SELECT value,updated_ts FROM s_bytes WHERE area=? AND address=?",
+                    (area.upper(), int(address)),
+                ).fetchone()
+                old_value = None if old is None else int(old["value"])
+                old_ts = None if old is None else float(old["updated_ts"])
+                if old_ts is not None and float(event_ts) < old_ts - 0.001:
+                    continue
+                self.conn.execute(
+                    """
+                    INSERT INTO s_bytes(area,address,value,msg_type,updated_ts)
+                    VALUES(?,?,?,?,?)
+                    ON CONFLICT(area,address) DO UPDATE SET
+                        value=excluded.value,
+                        msg_type=excluded.msg_type,
+                        updated_ts=excluded.updated_ts
+                    WHERE excluded.updated_ts >= s_bytes.updated_ts
+                    """,
+                    (area.upper(), int(address), int(new_value), "REFRESH", float(event_ts)),
+                )
+                if old_value is None or old_value == int(new_value):
+                    continue
+                for bit in range(8):
+                    old_bit = bit_value(old_value, bit)
+                    new_bit = bit_value(int(new_value), bit)
+                    if old_bit == new_bit:
+                        continue
+                    event = BitEvent(
+                        ts=float(event_ts), area=area.upper(), address=int(address), bit=bit,
+                        old_bit=old_bit, new_bit=new_bit, old_byte=old_value,
+                        new_byte=int(new_value), msg_type="REFRESH-DIFF",
+                    )
+                    differences.append(event)
+                    self.conn.execute(
+                        """
+                        INSERT INTO s_snapshot_differences(
+                            area,generation,observed_ts,address,bit,old_bit,new_bit,
+                            old_byte,new_byte,source_msg_type
+                        ) VALUES(?,?,?,?,?,?,?,?,?,?)
+                        """,
+                        (
+                            area.upper(), generation, float(event_ts), int(address), bit,
+                            old_bit, new_bit, old_value, int(new_value), source_msg_type,
+                        ),
+                    )
+
+            self.conn.execute(
+                """
+                UPDATE refresh_history
+                SET completed_event_ts=?, completed_received_ts=?, byte_count=?,
+                    status='complete', reason=''
+                WHERE id=?
+                """,
+                (float(completed_event_ts), received, len(staged), int(refresh_id)),
+            )
+            self.conn.execute(
+                """
+                INSERT INTO feed_state(
+                    area,snapshot_valid,snapshot_generation,refresh_in_progress,
+                    refresh_started_ts,last_complete_refresh_ts,
+                    last_complete_refresh_received_ts,last_s_event_ts,last_reason
+                ) VALUES(?,1,?,0,NULL,?,?,?,'complete SG...SH refresh')
+                ON CONFLICT(area) DO UPDATE SET
+                    snapshot_valid=1,
+                    snapshot_generation=excluded.snapshot_generation,
+                    refresh_in_progress=0,
+                    refresh_started_ts=NULL,
+                    last_complete_refresh_ts=excluded.last_complete_refresh_ts,
+                    last_complete_refresh_received_ts=excluded.last_complete_refresh_received_ts,
+                    last_s_event_ts=excluded.last_s_event_ts,
+                    last_reason=excluded.last_reason
+                """,
+                (
+                    area.upper(), generation, float(completed_event_ts), received,
+                    float(completed_event_ts),
+                ),
+            )
+        return generation, differences
+
+    def touch_feed_event(self, area: str, event_class: str, event_ts: float) -> None:
+        if getattr(self, "read_only", False):
+            return
+        column = "last_s_event_ts" if event_class.upper() == "S" else "last_c_event_ts"
+        with self.lock, self.conn:
+            self.conn.execute(
+                f"""
+                INSERT INTO feed_state(area,{column}) VALUES(?,?)
+                ON CONFLICT(area) DO UPDATE SET
+                    {column}=CASE
+                        WHEN feed_state.{column} IS NULL OR excluded.{column} > feed_state.{column}
+                        THEN excluded.{column} ELSE feed_state.{column} END
+                """,
+                (area.upper(), float(event_ts)),
+            )
+
+    def feed_state_row(self, area: str) -> Optional[sqlite3.Row]:
+        with self.lock:
+            return self.conn.execute("SELECT * FROM feed_state WHERE area=?", (area.upper(),)).fetchone()
+
+    def record_berth_step(
+        self,
+        *,
+        area: str,
+        ts: float,
+        descr: str,
+        from_berth: str,
+        to_berth: str,
+        topology_valid: bool,
+        special_reason: str,
+        raw: Dict[str, Any],
+    ) -> int:
+        if getattr(self, "read_only", False):
+            return 0
+        with self.lock, self.conn:
+            self.conn.execute(
+                """
+                INSERT OR IGNORE INTO berth_steps(
+                    area,event_ts,descr,from_berth,to_berth,source_msg_type,
+                    topology_valid,special_reason,raw_json
+                ) VALUES(?,?,?,?,?,'CA',?,?,?)
+                """,
+                (
+                    area.upper(), float(ts), descr, normalize_berth(from_berth),
+                    normalize_berth(to_berth), 1 if topology_valid else 0,
+                    special_reason, json.dumps(raw, sort_keys=True),
+                ),
+            )
+            row = self.conn.execute(
+                """
+                SELECT id FROM berth_steps
+                WHERE area=? AND event_ts=? AND from_berth=? AND to_berth=?
+                  AND COALESCE(descr,'')=COALESCE(?, '')
+                """,
+                (area.upper(), float(ts), normalize_berth(from_berth), normalize_berth(to_berth), descr),
+            ).fetchone()
+            return int(row["id"] if row else 0)
+
+    def current_snapshot(self, area: str) -> Tuple[bool, int, Dict[int, int], Optional[float], str]:
+        with self.lock:
+            state = self.conn.execute("SELECT * FROM feed_state WHERE area=?", (area.upper(),)).fetchone()
+            rows = self.conn.execute("SELECT address,value FROM s_bytes WHERE area=?", (area.upper(),)).fetchall()
+        valid = bool(state and int(state["snapshot_valid"] or 0))
+        generation = int(state["snapshot_generation"] or 0) if state else 0
+        last_refresh = float(state["last_complete_refresh_ts"]) if state and state["last_complete_refresh_ts"] is not None else None
+        reason = str(state["last_reason"] or "") if state else "no feed state"
+        return valid, generation, {int(r["address"]): int(r["value"]) for r in rows}, last_refresh, reason
+
+    def start_observation_session(self, signal_id: str, *, descr: str = "", notes: str = "") -> int:
+        now = time.time()
+        with self.lock, self.conn:
+            self.conn.execute(
+                "UPDATE signal_observation_sessions SET status='cancelled', closed_ts=? WHERE signal=? AND status='open'",
+                (now, normalize_berth(signal_id)),
+            )
+            cur = self.conn.execute(
+                """
+                INSERT INTO signal_observation_sessions(signal,status,started_ts,descr,notes)
+                VALUES(?,'open',?,?,?)
+                """,
+                (normalize_berth(signal_id), now, descr, notes),
+            )
+            return int(cur.lastrowid)
+
+    def latest_open_observation_session(self, signal_id: str) -> Optional[sqlite3.Row]:
+        with self.lock:
+            return self.conn.execute(
+                """
+                SELECT * FROM signal_observation_sessions
+                WHERE signal=? AND status='open'
+                ORDER BY started_ts DESC LIMIT 1
+                """,
+                (normalize_berth(signal_id),),
+            ).fetchone()
+
+    def add_signal_observation(
+        self,
+        *,
+        session_id: int,
+        signal_id: str,
+        state: str,
+        snapshot: Dict[int, int],
+        generation: int,
+        notes: str = "",
+        observed_ts: Optional[float] = None,
+    ) -> int:
+        ts = float(observed_ts if observed_ts is not None else time.time())
+        encoded = json.dumps({f"{k:02X}": int(v) for k, v in sorted(snapshot.items())}, separators=(",", ":"))
+        with self.lock, self.conn:
+            cur = self.conn.execute(
+                """
+                INSERT INTO signal_observations(
+                    session_id,signal,state,observed_ts,snapshot_json,snapshot_generation,notes
+                ) VALUES(?,?,?,?,?,?,?)
+                """,
+                (int(session_id), normalize_berth(signal_id), state.lower(), ts, encoded, int(generation), notes),
+            )
+            if state.lower() in {"post_pass", "complete"}:
+                self.conn.execute(
+                    "UPDATE signal_observation_sessions SET status='complete', closed_ts=? WHERE id=?",
+                    (ts, int(session_id)),
+                )
+            return int(cur.lastrowid)
+
+    def cancel_observation_session(self, session_id: int, reason: str = "cancelled") -> None:
+        with self.lock, self.conn:
+            self.conn.execute(
+                "UPDATE signal_observation_sessions SET status=?, closed_ts=?, notes=TRIM(COALESCE(notes,'') || ' ' || ?) WHERE id=?",
+                ("cancelled", time.time(), reason, int(session_id)),
+            )
+
     def record_berth_state(self, berth: str, descr: str, occupied: bool, ts: float, msg_type: str) -> None:
         """Store a simple latest berth/headcode occupancy state for Discord /signal.
 
@@ -731,8 +1328,19 @@ class Store:
                 INSERT INTO s_bit_events(
                     event_ts, area, address, bit, old_bit, new_bit,
                     old_byte, new_byte, msg_type
-                ) VALUES(?,?,?,?,?,?,?,?,?)
+                )
+                SELECT ?,?,?,?,?,?,?,?,?
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM s_bit_events
+                    WHERE event_ts=? AND area=? AND address=? AND bit=?
+                      AND COALESCE(old_bit,-1)=COALESCE(?,-1) AND new_bit=?
+                      AND COALESCE(old_byte,-1)=COALESCE(?,-1) AND new_byte=?
+                      AND COALESCE(msg_type,'')=COALESCE(?,'')
+                )
             """, (
+                event.ts, event.area, event.address, event.bit,
+                event.old_bit, event.new_bit, event.old_byte, event.new_byte,
+                event.msg_type,
                 event.ts, event.area, event.address, event.bit,
                 event.old_bit, event.new_bit, event.old_byte, event.new_byte,
                 event.msg_type,
@@ -1221,8 +1829,40 @@ class Learner:
         self.watch_all_bits = bool(watch_all_bits)
         self.record_unmapped_routes = bool(record_unmapped_routes)
 
+        # Persisted bytes are useful as a comparison baseline, but they are not
+        # trusted as a live snapshot after a restart/reconnect. Live state only
+        # becomes valid after a complete SG...SH refresh has been committed.
         self.current_bytes = self.store.load_bytes(self.area)
         self.current_byte_ts = self.store.load_byte_timestamps(self.area)
+        self.trusted_addresses: Set[int] = set()
+        state = self.store.feed_state_row(self.area)
+        self.snapshot_generation = int(state["snapshot_generation"] or 0) if state else 0
+        self.snapshot_valid = False
+
+        self.refresh_active = False
+        self.refresh_id = 0
+        self.refresh_started_event_ts: Optional[float] = None
+        self.refresh_started_received_ts: Optional[float] = None
+        self.refresh_buffer: Dict[int, Tuple[int, float, str]] = {}
+        self.refresh_message_count = 0
+        self.refresh_next_address: Optional[int] = None
+        self.refresh_max_gap_seconds = float(os.getenv("NR_REFRESH_MAX_GAP_SECONDS", "60"))
+        self.refresh_expected_start_address = parse_hex_address(
+            os.getenv("NR_REFRESH_EXPECTED_START_ADDRESS", "00")
+        )
+        configured_min = max(8, int(os.getenv("NR_REFRESH_MIN_BYTES", "8")))
+        known_addresses = [int(row.key.address, 16) for row in self.known.rows]
+        known_span = (
+            max(known_addresses) - self.refresh_expected_start_address + 1
+            if known_addresses and max(known_addresses) >= self.refresh_expected_start_address
+            else 0
+        )
+        # A complete refresh covers the whole TD S-Class bitfield. For T3 the
+        # supplied reference file reaches byte 2C, so an eight-byte tail cannot
+        # accidentally be accepted as a complete snapshot after reconnecting in
+        # the middle of a refresh.
+        self.refresh_min_bytes = max(configured_min, known_span)
+
         self.berth_ts = self.store.load_berth_timestamps()
         self.recent_events: Deque[BitEvent] = collections.deque(maxlen=25000)
         self.pending: List[PassWindow] = []
@@ -1238,68 +1878,252 @@ class Learner:
         if self.record_unmapped_routes:
             print("[INIT] missing topology will also record known-from/known-to CA routes not present in next-map")
 
+    def mark_connected(self) -> None:
+        with self.lock:
+            self.snapshot_valid = False
+            self.trusted_addresses.clear()
+            self._reset_refresh_state()
+        self.store.mark_connected(self.area)
+
+    def mark_feed_gap(self, reason: str = "feed disconnected") -> None:
+        with self.lock:
+            self.snapshot_valid = False
+            self.trusted_addresses.clear()
+            if self.refresh_active:
+                self.store.abort_refresh(self.area, self.refresh_id, reason)
+            self._reset_refresh_state()
+        self.store.mark_disconnected(self.area, reason)
+
+    def _reset_refresh_state(self) -> None:
+        self.refresh_active = False
+        self.refresh_id = 0
+        self.refresh_started_event_ts = None
+        self.refresh_started_received_ts = None
+        self.refresh_buffer = {}
+        self.refresh_message_count = 0
+        self.refresh_next_address = None
+
     def handle_message(self, key: str, msg: Dict[str, Any]) -> None:
         area = str(msg.get("area_id", "")).upper()
         if area != self.area:
             return
 
         msg_type = str(msg.get("msg_type") or key.replace("_MSG", "")).upper()
-        if msg_type in {"SF", "SG", "SH"} or key in {"SF_MSG", "SG_MSG", "SH_MSG"}:
-            self._handle_s(msg_type, msg)
-        elif msg_type in {"CA", "CB", "CC", "CT"} or key in {"CA_MSG", "CB_MSG", "CC_MSG", "CT_MSG"}:
-            self._handle_c(msg_type, msg)
+        if msg_type not in {"SF", "SG", "SH", "CA", "CB", "CC", "CT"}:
+            return
 
-    def _handle_s(self, msg_type: str, msg: Dict[str, Any]) -> None:
-        ts = parse_nr_time_ms(msg.get("time"))
+        try:
+            ts = parse_nr_time_ms(msg.get("time"))
+        except InvalidTDMessage as exc:
+            self.store.mark_invalid_message(self.area, f"{msg_type}: {exc}")
+            print(f"[WARN] Invalid {msg_type} ignored: {exc} {msg!r}", file=sys.stderr)
+            return
+
+        is_new, _fingerprint = self.store.record_raw_message(
+            area=self.area, msg_type=msg_type, msg=msg, event_ts=ts,
+        )
+        if not is_new:
+            if self.print_s or self.print_c:
+                print(f"[DUPLICATE] {fmt_ts(ts)} {msg_type} ignored")
+            return
+
+        if msg_type in {"SF", "SG", "SH"}:
+            self.store.touch_feed_event(self.area, "S", ts)
+            self._handle_s(msg_type, msg, ts)
+        else:
+            self.store.touch_feed_event(self.area, "C", ts)
+            self._handle_c(msg_type, msg, ts)
+
+    def _handle_s(self, msg_type: str, msg: Dict[str, Any], ts: float) -> None:
         try:
             start_address = parse_hex_address(msg.get("address"))
-            data_bytes = split_hex_bytes(msg.get("data"))
+            expected = 1 if msg_type == "SF" else 4
+            data_bytes = split_hex_bytes(msg.get("data"), expected_bytes=expected)
         except Exception as exc:
+            self.store.mark_invalid_message(self.area, f"{msg_type}: {exc}")
             print(f"[WARN] Bad S-Class ignored: {exc} {msg!r}", file=sys.stderr)
             return
 
+        if msg_type in {"SG", "SH"}:
+            self._handle_refresh_chunk(msg_type, ts, start_address, data_bytes)
+            return
+
+        # SF is the only precisely timed S-Class change message. SG/SH are
+        # snapshots and never create s_bit_events.
         with self.lock:
-            for offset, new_value in enumerate(data_bytes):
-                address = start_address + offset
-                old_ts = self.current_byte_ts.get(address)
-                if old_ts is not None and ts < old_ts - 0.001:
-                    if self.print_s:
-                        print(
-                            f"[S-SKIP-STALE] {fmt_ts(ts)} {msg_type} addr {address:02X} "
-                            f"ignored because latest stored byte is {fmt_ts(old_ts)}"
-                        )
-                    continue
-
-                old_value = self.current_bytes.get(address)
-                self.current_bytes[address] = new_value
-                self.current_byte_ts[address] = ts
-                self.store.save_byte(self.area, address, new_value, msg_type, ts)
-
-                if old_value is None:
-                    continue
-                if old_value == new_value:
-                    continue
-
-                changed = []
-                for bit in range(8):
-                    old_bit = bit_value(old_value, bit)
-                    new_bit = bit_value(new_value, bit)
-                    if old_bit == new_bit:
-                        continue
-                    event = BitEvent(
-                        ts=ts, area=self.area, address=address, bit=bit,
-                        old_bit=old_bit, new_bit=new_bit,
-                        old_byte=old_value, new_byte=new_value, msg_type=msg_type,
+            address = start_address
+            new_value = data_bytes[0]
+            old_ts = self.current_byte_ts.get(address)
+            if old_ts is not None and ts < old_ts - 0.001:
+                if self.print_s:
+                    print(
+                        f"[S-SKIP-STALE] {fmt_ts(ts)} SF addr {address:02X} "
+                        f"ignored because latest stored byte is {fmt_ts(old_ts)}"
                     )
-                    self.recent_events.append(event)
-                    self.store.record_raw_bit_event(event)
-                    self._maybe_print_watch(event)
-                    changed.append(f"b{bit}:{old_bit}->{new_bit}")
+                return
 
-                if self.print_s and changed:
-                    print(f"[S] {fmt_ts(ts)} {msg_type} addr {address:02X} {old_value:02X}->{new_value:02X} {' '.join(changed)}")
+            old_value = self.current_bytes.get(address)
+            old_was_trusted = address in self.trusted_addresses
+            self.current_bytes[address] = new_value
+            self.current_byte_ts[address] = ts
+            self.trusted_addresses.add(address)
+            self.store.save_byte(self.area, address, new_value, msg_type, ts)
 
+            # The first SF for an address after restart establishes a trusted
+            # baseline; it cannot prove an edge from the persisted stale value.
+            if old_value is None or old_value == new_value or not old_was_trusted:
+                return
+
+            changed = []
+            for bit in range(8):
+                old_bit = bit_value(old_value, bit)
+                new_bit = bit_value(new_value, bit)
+                if old_bit == new_bit:
+                    continue
+                event = BitEvent(
+                    ts=ts, area=self.area, address=address, bit=bit,
+                    old_bit=old_bit, new_bit=new_bit,
+                    old_byte=old_value, new_byte=new_value, msg_type=msg_type,
+                )
+                self.recent_events.append(event)
+                self.store.record_raw_bit_event(event)
+                self._maybe_print_watch(event)
+                changed.append(f"b{bit}:{old_bit}->{new_bit}")
+
+            if self.print_s and changed:
+                print(f"[S] {fmt_ts(ts)} SF addr {address:02X} {old_value:02X}->{new_value:02X} {' '.join(changed)}")
             self._prune_locked(time.time())
+
+    def _handle_refresh_chunk(
+        self,
+        msg_type: str,
+        ts: float,
+        start_address: int,
+        data_bytes: Sequence[int],
+    ) -> None:
+        """Stage one ordered four-byte SG/SH refresh chunk.
+
+        A complete S-Class refresh is an ordered SG sequence terminated by an
+        SH message, and SH contains its own final four-byte block.  The bot only
+        promotes a snapshot to live after seeing the configured first address,
+        every contiguous chunk, the final SH, and enough bytes to cover the
+        known T3 address span.  This prevents a reconnect in the middle of a
+        refresh from producing a plausible-looking but incomplete snapshot.
+        """
+        received = time.time()
+        with self.lock:
+            if msg_type == "SH" and not self.refresh_active:
+                self.store.mark_invalid_message(self.area, "orphan SH without preceding complete SG sequence")
+                if self.print_s:
+                    print(f"[REFRESH-SKIP] {fmt_ts(ts)} orphan SH ignored")
+                return
+
+            if msg_type == "SG" and self.refresh_active:
+                timed_out = (
+                    self.refresh_started_received_ts is not None
+                    and received - self.refresh_started_received_ts > self.refresh_max_gap_seconds
+                )
+                restarted = (
+                    self.refresh_message_count > 0
+                    and start_address == self.refresh_expected_start_address
+                )
+                if timed_out or restarted:
+                    reason = (
+                        "refresh timed out before final SH; new SG sequence started"
+                        if timed_out
+                        else "new refresh start received before prior SH"
+                    )
+                    self.store.abort_refresh(self.area, self.refresh_id, reason)
+                    self._reset_refresh_state()
+
+            if not self.refresh_active:
+                if msg_type != "SG":
+                    self.store.mark_invalid_message(self.area, "refresh did not begin with SG")
+                    return
+                if start_address != self.refresh_expected_start_address:
+                    reason = (
+                        f"partial refresh ignored: first SG address {start_address:02X}; "
+                        f"expected {self.refresh_expected_start_address:02X}"
+                    )
+                    self.store.mark_invalid_message(self.area, reason)
+                    if self.print_s:
+                        print(f"[REFRESH-SKIP] {fmt_ts(ts)} {reason}")
+                    return
+                self.refresh_active = True
+                self.refresh_started_event_ts = ts
+                self.refresh_started_received_ts = received
+                self.refresh_id = self.store.begin_refresh(self.area, ts, received)
+                self.refresh_buffer = {}
+                self.refresh_message_count = 0
+                self.refresh_next_address = self.refresh_expected_start_address
+
+            expected_address = self.refresh_next_address
+            if expected_address is None or start_address != expected_address:
+                reason = (
+                    f"non-contiguous refresh chunk {start_address:02X}; "
+                    f"expected {expected_address:02X}" if expected_address is not None
+                    else f"refresh sequence state missing before chunk {start_address:02X}"
+                )
+                self.store.abort_refresh(self.area, self.refresh_id, reason)
+                self.store.mark_invalid_message(self.area, reason)
+                self._reset_refresh_state()
+                if self.print_s:
+                    print(f"[REFRESH-SKIP] {fmt_ts(ts)} {reason}")
+                return
+
+            for offset, value in enumerate(data_bytes):
+                self.refresh_buffer[start_address + offset] = (int(value), float(ts), msg_type)
+            self.refresh_message_count += 1
+            self.refresh_next_address = start_address + len(data_bytes)
+
+            if msg_type != "SH":
+                if self.print_s:
+                    print(
+                        f"[REFRESH] {fmt_ts(ts)} SG start={start_address:02X} "
+                        f"staged_bytes={len(self.refresh_buffer)}"
+                    )
+                return
+
+            addresses = sorted(self.refresh_buffer)
+            contiguous = bool(addresses) and addresses == list(range(addresses[0], addresses[-1] + 1))
+            if not contiguous or addresses[0] != self.refresh_expected_start_address:
+                reason = "refresh address set is incomplete or non-contiguous"
+                self.store.abort_refresh(self.area, self.refresh_id, reason)
+                self.store.mark_invalid_message(self.area, reason)
+                self._reset_refresh_state()
+                return
+
+            if len(self.refresh_buffer) < self.refresh_min_bytes:
+                reason = (
+                    f"complete marker received but only {len(self.refresh_buffer)} bytes staged; "
+                    f"minimum is {self.refresh_min_bytes}"
+                )
+                self.store.abort_refresh(self.area, self.refresh_id, reason)
+                self.store.mark_invalid_message(self.area, reason)
+                self._reset_refresh_state()
+                return
+
+            generation, differences = self.store.commit_refresh_snapshot(
+                area=self.area,
+                refresh_id=self.refresh_id,
+                staged=self.refresh_buffer,
+                completed_event_ts=ts,
+                received_ts=received,
+            )
+            for address, (value, event_ts, _source) in self.refresh_buffer.items():
+                old_ts = self.current_byte_ts.get(address)
+                if old_ts is None or event_ts >= old_ts - 0.001:
+                    self.current_bytes[address] = int(value)
+                    self.current_byte_ts[address] = float(event_ts)
+            self.trusted_addresses.update(self.refresh_buffer.keys())
+            self.snapshot_valid = True
+            self.snapshot_generation = generation
+            if self.print_s:
+                print(
+                    f"[REFRESH-COMPLETE] {fmt_ts(ts)} generation={generation} "
+                    f"bytes={len(self.refresh_buffer)} observational_differences={len(differences)}"
+                )
+            self._reset_refresh_state()
 
     def _maybe_print_watch(self, event: BitEvent) -> None:
         key = event.key
@@ -1320,8 +2144,7 @@ class Learner:
             if berth:
                 self.berth_ts[berth] = max(float(ts), float(self.berth_ts.get(berth, 0.0)))
 
-    def _handle_c(self, msg_type: str, msg: Dict[str, Any]) -> None:
-        ts = parse_nr_time_ms(msg.get("time"))
+    def _handle_c(self, msg_type: str, msg: Dict[str, Any], ts: float) -> None:
         if self.print_c and msg_type != "CT":
             print(f"[C] {fmt_ts(ts)} {msg_type} {msg}")
 
@@ -1381,17 +2204,28 @@ class Learner:
 
         self._check_missing_topology(ts, descr, from_berth, to_berth, msg)
 
+        expected = self.topology.get(from_berth, set())
+        special_reason = SPECIAL_NON_LEARNING_MOVES.get((from_berth, to_berth), "")
+        step_id = self.store.record_berth_step(
+            area=self.area,
+            ts=ts,
+            descr=descr,
+            from_berth=from_berth,
+            to_berth=to_berth,
+            topology_valid=bool(expected and to_berth in expected),
+            special_reason=special_reason,
+            raw=msg,
+        )
+
         if from_berth not in self.watch_signals:
             return
 
-        special_reason = SPECIAL_NON_LEARNING_MOVES.get((from_berth, to_berth), "")
         if special_reason and not self.learn_special:
-            print(f"[PASS-SKIP] {fmt_ts(ts)} {from_berth}->{to_berth} {descr or '----'} special: {special_reason}")
+            print(f"[STEP-WINDOW-SKIP] {fmt_ts(ts)} step_id={step_id} {from_berth}->{to_berth} {descr or '----'} special: {special_reason}")
             return
 
-        expected = self.topology.get(from_berth, set())
         if self.strict and (not expected or to_berth not in expected):
-            print(f"[PASS-SKIP] {fmt_ts(ts)} {from_berth}->{to_berth} not in topology nexts={sorted(expected)}")
+            print(f"[STEP-WINDOW-SKIP] {fmt_ts(ts)} step_id={step_id} {from_berth}->{to_berth} not in topology nexts={sorted(expected)}")
             return
 
         with self.lock:
@@ -1409,7 +2243,10 @@ class Learner:
             obs.pass_id = pass_id
             self.pending.append(obs)
 
-        print(f"[PASS] {fmt_ts(ts)} id={pass_id} {from_berth}->{to_berth} {descr or '----'} pre_events={len(pre_events)}")
+        print(
+            f"[STEP-WINDOW] {fmt_ts(ts)} legacy_window_id={pass_id} step_id={step_id} "
+            f"{from_berth}->{to_berth} {descr or '----'} pre_events={len(pre_events)}"
+        )
 
     def _check_missing_topology(self, ts: float, descr: str, from_berth: str, to_berth: str, raw: Dict[str, Any]) -> None:
         from_real = from_berth in self.topology
@@ -1485,13 +2322,447 @@ class Learner:
             stored += 1
 
         self.store.finalise_pass(obs.pass_id, stored)
-        print(f"[RESULT] id={obs.pass_id} {obs.signal}->{obs.to_berth} events={stored} known_hidden_by_default={hidden_by_default}")
+        print(
+            f"[STEP-WINDOW-RESULT] legacy_window_id={obs.pass_id} "
+            f"{obs.signal}->{obs.to_berth} events={stored} known_hidden_by_default={hidden_by_default}"
+        )
 
     def _prune_locked(self, now: float) -> None:
         cutoff = now - self.recent_keep
         while self.recent_events and self.recent_events[0].ts < cutoff:
             self.recent_events.popleft()
 
+
+
+# =============================================================================
+# Protocol-level inference
+# =============================================================================
+
+def _canonical_step_rows(
+    conn: sqlite3.Connection,
+    signal_id: str,
+    *,
+    area: str = "T3",
+    limit: int = 250,
+    to_berth: Optional[str] = None,
+) -> List[sqlite3.Row]:
+    signal_id = normalize_berth(signal_id)
+    has_steps = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='berth_steps'"
+    ).fetchone()
+    to_norm = normalize_berth(to_berth) if to_berth else None
+    if has_steps:
+        if to_norm:
+            return list(conn.execute(
+                """
+                SELECT id,event_ts,descr,from_berth,to_berth,source_msg_type
+                FROM berth_steps
+                WHERE area=? AND from_berth=? AND to_berth=?
+                ORDER BY event_ts DESC LIMIT ?
+                """,
+                (area.upper(), signal_id, to_norm, int(limit)),
+            ).fetchall())[::-1]
+        return list(conn.execute(
+            """
+            SELECT id,event_ts,descr,from_berth,to_berth,source_msg_type
+            FROM berth_steps
+            WHERE area=? AND from_berth=?
+            ORDER BY event_ts DESC LIMIT ?
+            """,
+            (area.upper(), signal_id, int(limit)),
+        ).fetchall())[::-1]
+    if to_norm:
+        return list(conn.execute(
+            """
+            SELECT id,pass_ts AS event_ts,descr,from_berth,to_berth,'CA-legacy' AS source_msg_type
+            FROM pass_log WHERE signal=? AND to_berth=? ORDER BY pass_ts DESC LIMIT ?
+            """,
+            (signal_id, to_norm, int(limit)),
+        ).fetchall())[::-1]
+    return list(conn.execute(
+        """
+        SELECT id,pass_ts AS event_ts,descr,from_berth,to_berth,'CA-legacy' AS source_msg_type
+        FROM pass_log WHERE signal=? ORDER BY pass_ts DESC LIMIT ?
+        """,
+        (signal_id, int(limit)),
+    ).fetchall())[::-1]
+
+
+def _slice_bit_events(
+    timestamps: Sequence[float],
+    rows: Sequence[sqlite3.Row],
+    start_ts: float,
+    end_ts: float,
+) -> Sequence[sqlite3.Row]:
+    left = bisect.bisect_left(timestamps, start_ts)
+    right = bisect.bisect_right(timestamps, end_ts)
+    return rows[left:right]
+
+
+
+def _assign_pre_edges_one_to_one(
+    rows: Sequence[sqlite3.Row],
+    step_times: Sequence[float],
+    direction: Tuple[int, int],
+    *,
+    pre_seconds: float,
+    post_seconds: float,
+    near_step_seconds: float,
+) -> Dict[str, Any]:
+    """Match each SF edge and each berth step at most once.
+
+    This avoids a single long-lived route/signal edge being counted as support
+    for several trains. Candidate pairings are resolved by the shortest lead
+    time, then an unused opposite edge after the step is attached as the cycle
+    restoration where available.
+    """
+    old_bit, new_bit = direction
+    ordered_steps = list(step_times)
+    candidates: List[Tuple[float, int, int]] = []
+    for event_index, row in enumerate(rows):
+        if int(row["old_bit"]) != old_bit or int(row["new_bit"]) != new_bit:
+            continue
+        event_ts = float(row["event_ts"])
+        left = bisect.bisect_left(ordered_steps, event_ts + near_step_seconds)
+        right = bisect.bisect_right(ordered_steps, event_ts + pre_seconds)
+        for step_index in range(left, right):
+            lead = ordered_steps[step_index] - event_ts
+            candidates.append((lead, step_index, event_index))
+
+    used_steps: Set[int] = set()
+    used_events: Set[int] = set()
+    assignments: List[Tuple[int, int, float]] = []
+    for lead, step_index, event_index in sorted(candidates):
+        if step_index in used_steps or event_index in used_events:
+            continue
+        used_steps.add(step_index)
+        used_events.add(event_index)
+        assignments.append((step_index, event_index, lead))
+
+    used_reverse: Set[int] = set()
+    durations: List[float] = []
+    cycle_count = 0
+    leads: List[float] = []
+    for step_index, event_index, lead in sorted(assignments):
+        leads.append(float(lead))
+        step_ts = ordered_steps[step_index]
+        start_ts = float(rows[event_index]["event_ts"])
+        for reverse_index in range(event_index + 1, len(rows)):
+            if reverse_index in used_reverse:
+                continue
+            reverse = rows[reverse_index]
+            reverse_ts = float(reverse["event_ts"])
+            if reverse_ts < step_ts:
+                continue
+            if reverse_ts > step_ts + post_seconds:
+                break
+            if int(reverse["old_bit"]) == new_bit and int(reverse["new_bit"]) == old_bit:
+                used_reverse.add(reverse_index)
+                cycle_count += 1
+                durations.append(reverse_ts - start_ts)
+                break
+
+    return {
+        "pre": len(assignments),
+        "cycles": cycle_count,
+        "leads": leads,
+        "durations": durations,
+    }
+
+
+def _assign_near_pulses_one_to_one(
+    rows: Sequence[sqlite3.Row],
+    step_times: Sequence[float],
+    *,
+    near_step_seconds: float,
+    pulse_max_seconds: float,
+) -> Tuple[int, List[float]]:
+    """Match near-step edges and their reversals without reusing either."""
+    ordered_steps = list(step_times)
+    candidates: List[Tuple[float, int, int]] = []
+    for event_index, row in enumerate(rows):
+        event_ts = float(row["event_ts"])
+        left = bisect.bisect_left(ordered_steps, event_ts - near_step_seconds)
+        right = bisect.bisect_right(ordered_steps, event_ts + near_step_seconds)
+        for step_index in range(left, right):
+            candidates.append((abs(ordered_steps[step_index] - event_ts), step_index, event_index))
+
+    used_steps: Set[int] = set()
+    used_events: Set[int] = set()
+    assignments: List[Tuple[int, int]] = []
+    for _distance, step_index, event_index in sorted(candidates):
+        if step_index in used_steps or event_index in used_events:
+            continue
+        used_steps.add(step_index)
+        used_events.add(event_index)
+        assignments.append((step_index, event_index))
+
+    used_reverse: Set[int] = set()
+    durations: List[float] = []
+    for _step_index, event_index in sorted(assignments):
+        edge = rows[event_index]
+        edge_ts = float(edge["event_ts"])
+        old_bit = int(edge["old_bit"])
+        new_bit = int(edge["new_bit"])
+        for reverse_index in range(event_index + 1, len(rows)):
+            if reverse_index in used_reverse:
+                continue
+            reverse = rows[reverse_index]
+            reverse_ts = float(reverse["event_ts"])
+            if reverse_ts - edge_ts > pulse_max_seconds:
+                break
+            if int(reverse["old_bit"]) == new_bit and int(reverse["new_bit"]) == old_bit:
+                used_reverse.add(reverse_index)
+                durations.append(reverse_ts - edge_ts)
+                break
+    return len(assignments), durations
+
+def protocol_candidate_analysis(
+    conn: sqlite3.Connection,
+    signal_id: str,
+    *,
+    area: str = "T3",
+    max_steps: int = 250,
+    pre_seconds: float = 120.0,
+    post_seconds: float = 180.0,
+    near_step_seconds: float = 2.5,
+    pulse_max_seconds: float = 90.0,
+    control_multiplier: int = 5,
+    to_berth: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Classify raw S-Class bits around C-Class berth steps conservatively.
+
+    The function deliberately does *not* call a candidate a signal aspect. It
+    distinguishes short movement/track-shaped pulses from longer pre-step
+    control cycles, and compares the latter with unrelated berth steps as a
+    control population. A pre-step control may still be a route indication.
+    """
+    signal_id = normalize_berth(signal_id)
+    steps = _canonical_step_rows(
+        conn, signal_id, area=area, limit=max_steps, to_berth=to_berth
+    )
+    if not steps:
+        return []
+    step_times = [float(r["event_ts"]) for r in steps]
+    range_start = min(step_times) - float(pre_seconds)
+    range_end = max(step_times) + float(post_seconds)
+
+    event_rows = conn.execute(
+        """
+        SELECT event_ts,address,bit,old_bit,new_bit,old_byte,new_byte,msg_type
+        FROM s_bit_events
+        WHERE area=? AND event_ts BETWEEN ? AND ?
+          AND old_bit IS NOT NULL AND old_bit != new_bit
+          AND UPPER(COALESCE(msg_type,''))='SF'
+        ORDER BY address,bit,event_ts
+        """,
+        (area.upper(), range_start, range_end),
+    ).fetchall()
+    by_bit: Dict[BitKey, List[sqlite3.Row]] = collections.defaultdict(list)
+    for row in event_rows:
+        by_bit[BitKey(f"{int(row['address']):02X}", int(row["bit"]))].append(row)
+
+    control_limit = max(50, min(2000, len(steps) * max(1, int(control_multiplier))))
+    has_steps = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='berth_steps'"
+    ).fetchone()
+    if has_steps:
+        control_rows = conn.execute(
+            """
+            SELECT event_ts FROM berth_steps
+            WHERE area=? AND from_berth<>? AND event_ts BETWEEN ? AND ?
+            ORDER BY event_ts DESC LIMIT ?
+            """,
+            (area.upper(), signal_id, min(step_times), max(step_times), control_limit),
+        ).fetchall()
+    else:
+        control_rows = conn.execute(
+            """
+            SELECT pass_ts AS event_ts FROM pass_log
+            WHERE signal<>? AND pass_ts BETWEEN ? AND ?
+            ORDER BY pass_ts DESC LIMIT ?
+            """,
+            (signal_id, min(step_times), max(step_times), control_limit),
+        ).fetchall()
+    control_times = [float(r["event_ts"]) for r in control_rows]
+
+    results: List[Dict[str, Any]] = []
+    for key, rows in by_bit.items():
+        near_hits, near_reverse_durations = _assign_near_pulses_one_to_one(
+            rows,
+            step_times,
+            near_step_seconds=near_step_seconds,
+            pulse_max_seconds=pulse_max_seconds,
+        )
+        direction_stats: Dict[Tuple[int, int], Dict[str, Any]] = {
+            direction: _assign_pre_edges_one_to_one(
+                rows,
+                step_times,
+                direction,
+                pre_seconds=pre_seconds,
+                post_seconds=post_seconds,
+                near_step_seconds=near_step_seconds,
+            )
+            for direction in ((0, 1), (1, 0))
+        }
+
+        direction, best = max(
+            direction_stats.items(),
+            key=lambda item: (item[1]["cycles"], item[1]["pre"]),
+        )
+        target_count = len(step_times)
+        pre_rate = best["pre"] / target_count if target_count else 0.0
+        cycle_rate = best["cycles"] / target_count if target_count else 0.0
+        near_rate = near_hits / target_count if target_count else 0.0
+        reverse_rate = (
+            len(near_reverse_durations) / near_hits if near_hits else 0.0
+        )
+
+        control_hits = 0
+        if control_times and best["pre"]:
+            control_stats = _assign_pre_edges_one_to_one(
+                rows,
+                sorted(control_times),
+                direction,
+                pre_seconds=pre_seconds,
+                post_seconds=post_seconds,
+                near_step_seconds=near_step_seconds,
+            )
+            control_hits = int(control_stats["pre"])
+        control_rate = control_hits / len(control_times) if control_times else 0.0
+        lift = pre_rate - control_rate
+        median_lead = statistics.median(best["leads"]) if best["leads"] else None
+        median_cycle = statistics.median(best["durations"]) if best["durations"] else None
+        median_pulse = statistics.median(near_reverse_durations) if near_reverse_durations else None
+
+        if (
+            near_rate >= 0.60
+            and reverse_rate >= 0.50
+            and median_pulse is not None
+            and median_pulse <= pulse_max_seconds
+        ):
+            classification = "movement_pulse"
+            explanation = "changes at/after the berth step and reverses shortly afterwards; track/step/release shaped"
+            score = near_rate + reverse_rate
+        elif (
+            best["cycles"] >= 3
+            and cycle_rate >= 0.50
+            and lift >= 0.20
+            and median_lead is not None
+            and median_lead > near_step_seconds
+        ):
+            classification = "pre_step_control"
+            explanation = "changes before the berth step and later restores; signal-or-route candidate, not distinguishable from S-Class alone"
+            score = cycle_rate + max(0.0, lift)
+        elif best["pre"] >= 3 and pre_rate >= 0.40:
+            classification = "correlated_control"
+            explanation = "correlates with this berth's movements but lacks a complete aspect-like cycle or sufficient control lift"
+            score = pre_rate + max(0.0, lift) * 0.5
+        else:
+            continue
+
+        results.append({
+            "key": key,
+            "classification": classification,
+            "explanation": explanation,
+            "target_steps": target_count,
+            "pre_hits": int(best["pre"]),
+            "cycle_hits": int(best["cycles"]),
+            "near_hits": int(near_hits),
+            "pre_rate": pre_rate,
+            "cycle_rate": cycle_rate,
+            "near_rate": near_rate,
+            "near_reverse_rate": reverse_rate,
+            "control_steps": len(control_times),
+            "control_hits": int(control_hits),
+            "control_rate": control_rate,
+            "lift": lift,
+            "direction": f"{direction[0]}->{direction[1]}",
+            "median_lead": median_lead,
+            "median_cycle": median_cycle,
+            "median_pulse": median_pulse,
+            "score": score,
+        })
+
+    class_order = {"movement_pulse": 0, "pre_step_control": 1, "correlated_control": 2}
+    results.sort(
+        key=lambda r: (
+            class_order.get(str(r["classification"]), 9),
+            -float(r["score"]),
+            int(r["key"].address, 16),
+            int(r["key"].bit),
+        )
+    )
+    return results
+
+
+def manual_observation_candidates(
+    conn: sqlite3.Connection,
+    signal_id: str,
+) -> List[Dict[str, Any]]:
+    """Compare paired physical RED/OFF snapshots for one signal."""
+    signal_id = normalize_berth(signal_id)
+    sessions = conn.execute(
+        """
+        SELECT * FROM signal_observation_sessions
+        WHERE signal=? ORDER BY started_ts
+        """,
+        (signal_id,),
+    ).fetchall()
+    counts: Dict[Tuple[BitKey, str], Dict[str, Any]] = {}
+    complete_pairs = 0
+    for session in sessions:
+        observations = conn.execute(
+            """
+            SELECT * FROM signal_observations
+            WHERE session_id=? ORDER BY observed_ts
+            """,
+            (int(session["id"]),),
+        ).fetchall()
+        by_state: Dict[str, sqlite3.Row] = {}
+        for row in observations:
+            by_state[str(row["state"]).lower()] = row
+        if "red" not in by_state or "off" not in by_state:
+            continue
+        complete_pairs += 1
+        red = {int(k, 16): int(v) for k, v in json.loads(by_state["red"]["snapshot_json"]).items()}
+        off = {int(k, 16): int(v) for k, v in json.loads(by_state["off"]["snapshot_json"]).items()}
+        post_row = by_state.get("post_pass")
+        post = (
+            {int(k, 16): int(v) for k, v in json.loads(post_row["snapshot_json"]).items()}
+            if post_row is not None else None
+        )
+        for address in set(red) & set(off):
+            for bit in range(8):
+                red_bit = bit_value(red[address], bit)
+                off_bit = bit_value(off[address], bit)
+                if red_bit == off_bit:
+                    continue
+                key = BitKey(f"{address:02X}", bit)
+                direction = f"{red_bit}->{off_bit}"
+                item = counts.setdefault((key, direction), {
+                    "key": key,
+                    "direction": direction,
+                    "support": 0,
+                    "returned": 0,
+                    "sessions": complete_pairs,
+                })
+                item["support"] += 1
+                if post is not None and address in post and bit_value(post[address], bit) == red_bit:
+                    item["returned"] += 1
+
+    out = []
+    for item in counts.values():
+        support = int(item["support"])
+        if support < 2:
+            continue
+        item = dict(item)
+        item["pair_count"] = complete_pairs
+        item["consistency"] = support / complete_pairs if complete_pairs else 0.0
+        item["return_rate"] = item["returned"] / support if support else 0.0
+        out.append(item)
+    out.sort(key=lambda r: (-float(r["consistency"]), -int(r["support"]), r["key"].label))
+    return out
 
 # =============================================================================
 # Reports
@@ -1852,19 +3123,51 @@ def print_missing_report(store: Store, *, export_path: Optional[Path] = None, sh
 
 def print_movement_report(store: Store, known: KnownBits, berth: str, *, limit: int, show_events: bool, event_limit: int) -> None:
     berth = normalize_berth(berth)
-    print(f"[MOVES] Learned/pass-log movements involving berth/signal {berth}")
+    print(f"[MOVES] C-Class berth steps involving {berth}")
+    with store.lock:
+        has_steps = store.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='berth_steps'"
+        ).fetchone()
+        if has_steps:
+            summary = store.conn.execute(
+                """
+                SELECT from_berth,to_berth,COUNT(*) AS count,MAX(event_ts) AS last_ts
+                FROM berth_steps
+                WHERE from_berth=? OR to_berth=?
+                GROUP BY from_berth,to_berth
+                ORDER BY last_ts DESC
+                """,
+                (berth, berth),
+            ).fetchall()
+            rows = store.conn.execute(
+                """
+                SELECT * FROM berth_steps
+                WHERE from_berth=? OR to_berth=?
+                ORDER BY event_ts DESC LIMIT ?
+                """,
+                (berth, berth, int(limit)),
+            ).fetchall()
+        else:
+            summary = []
+            rows = []
 
-    summary = store.movement_summary_rows(berth)
     if summary:
-        print("[MOVES] Route summary:")
+        print("[MOVES] Canonical route summary:")
         for r in summary:
             print(
                 f"  {r['from_berth']}->{r['to_berth']} count={int(r['count'])} "
-                f"finalised={int(r['finalised_count'] or 0)} bit_events={int(r['bit_event_count'] or 0)} "
                 f"last={fmt_ts(float(r['last_ts']))}"
             )
+    if rows:
+        print("[MOVES] Recent canonical CA berth steps:")
+        for r in rows:
+            print(
+                f"  step_id={int(r['id'])} {fmt_ts(float(r['event_ts']))} "
+                f"{r['from_berth']}->{r['to_berth']} {r['descr'] or '----'} "
+                f"source={r['source_msg_type'] or 'CA'} topology_valid={bool(r['topology_valid'])}"
+            )
     else:
-        print("[MOVES] No pass_log movements found for this berth.")
+        print("[MOVES] No canonical berth steps found for this berth.")
 
     missing = store.missing_rows_for_berth(berth, limit=limit)
     if missing:
@@ -1876,30 +3179,30 @@ def print_movement_report(store: Store, known: KnownBits, berth: str, *, limit: 
                 f"expected={r['expected_nexts'] or '-'}"
             )
 
-    rows = store.movement_rows(berth, limit=limit)
-    if not rows:
+    if not show_events:
         return
-
-    print("[MOVES] Recent pass_log rows:")
-    for r in rows:
-        final = "finalised" if r["finalised_ts"] is not None else "pending"
+    legacy_rows = store.movement_rows(berth, limit=limit)
+    if not legacy_rows:
+        print("[MOVES] No legacy movement windows with attached SF evidence.")
+        return
+    print(
+        "[MOVES] Legacy +/- window attachments below are diagnostic only. "
+        "A CA is a berth step, and nearby SF edges are not automatically signal aspects."
+    )
+    for r in legacy_rows:
         print(
-            f"  id={int(r['id'])} {fmt_ts(float(r['pass_ts']))} "
+            f"  legacy_window_id={int(r['id'])} {fmt_ts(float(r['pass_ts']))} "
             f"{r['from_berth']}->{r['to_berth']} {r['descr'] or '----'} "
-            f"signal={r['signal']} events={int(r['event_count'] or 0)} {final}"
+            f"events={int(r['event_count'] or 0)}"
         )
-        if show_events:
-            events = store.pass_events(int(r["id"]), limit=event_limit)
-            for e in events:
-                key = BitKey(f"{int(e['address']):02X}", int(e["bit"]))
-                status = "KNOWN" if known.described(key) else "UNKNOWN"
-                old_byte = "??" if e["old_byte"] is None else f"{int(e['old_byte']):02X}"
-                print(
-                    f"      {e['phase']:<6} {float(e['delta_seconds']):>+5.1f}s "
-                    f"{key.label:<5} {status:<7} "
-                    f"{e['old_bit']}->{e['new_bit']} byte {old_byte}->{int(e['new_byte']):02X} "
-                    f"{e['msg_type'] or ''} | {known.describe(key)}"
-                )
+        for e in store.pass_events(int(r["id"]), limit=event_limit):
+            key = BitKey(f"{int(e['address']):02X}", int(e["bit"]))
+            old_byte = "??" if e["old_byte"] is None else f"{int(e['old_byte']):02X}"
+            print(
+                f"      {e['phase']:<6} {float(e['delta_seconds']):>+5.1f}s "
+                f"{key.label:<5} {e['old_bit']}->{e['new_bit']} "
+                f"byte {old_byte}->{int(e['new_byte']):02X} {e['msg_type'] or ''} | {known.describe(key)}"
+            )
 
 
 def print_bit_history(
@@ -2079,18 +3382,31 @@ def print_bit_history(
 # =============================================================================
 
 class Listener(stomp.ConnectionListener if stomp is not None else object):
-    def __init__(self, learner: Learner):
+    def __init__(self, learner: Learner, connection: Any = None, subscription_id: str = ""):
         self.learner = learner
+        self.connection = connection
+        self.subscription_id = subscription_id
         self.messages = 0
         self.last_error = ""
 
     def on_message(self, frame):
         self.messages += 1
+        headers = getattr(frame, "headers", {}) or {}
+        ack_id = str(headers.get("ack") or headers.get("message-id") or "")
         try:
-            for key, payload in iter_message_objects(frame.body):
+            messages = list(iter_message_objects(frame.body))
+            for key, payload in messages:
                 self.learner.handle_message(key, payload)
+            if ack_id and self.connection is not None:
+                self.connection.ack(id=ack_id)
+        except InvalidTDMessage as exc:
+            self.learner.store.mark_invalid_message(self.learner.area, f"STOMP frame: {exc}")
+            print(f"[WARN] malformed TD frame discarded: {exc}", file=sys.stderr)
+            if ack_id and self.connection is not None:
+                with contextlib.suppress(Exception):
+                    self.connection.ack(id=ack_id)
         except Exception:
-            print("[ERROR] failed to handle STOMP frame", file=sys.stderr)
+            print("[ERROR] failed to handle STOMP frame; frame left unacknowledged", file=sys.stderr)
             traceback.print_exc()
 
     def on_error(self, frame):
@@ -2098,6 +3414,7 @@ class Listener(stomp.ConnectionListener if stomp is not None else object):
         print(f"[STOMP-ERROR] {self.last_error}", file=sys.stderr)
 
     def on_disconnected(self):
+        self.learner.mark_feed_gap("STOMP disconnected")
         print("[STOMP] disconnected")
 
 
@@ -2130,7 +3447,7 @@ def run_live(args: argparse.Namespace, learner: Learner) -> None:
     signal_module.signal(signal_module.SIGINT, stop_handler)
     signal_module.signal(signal_module.SIGTERM, stop_handler)
 
-    listener = Listener(learner)
+    listener: Optional[Listener] = None
     delay = args.reconnect_delay
 
     learner.start_banner()
@@ -2144,17 +3461,28 @@ def run_live(args: argparse.Namespace, learner: Learner) -> None:
                 keepalive=True,
                 heartbeats=(args.heartbeat_ms, args.heartbeat_ms),
             )
+            listener = Listener(learner, conn, args.subscription_id)
             conn.set_listener("t3-clean-learner", listener)
-            conn.connect(username=username, passcode=password, wait=True)
-            conn.subscribe(destination=args.topic, id=args.subscription_id, ack="auto")
-            print("[STOMP] subscribed")
+            client_id = (args.client_id or username).strip()
+            connect_headers = {"client-id": client_id} if args.durable else {}
+            conn.connect(username=username, passcode=password, wait=True, headers=connect_headers)
+            learner.mark_connected()
+            subscribe_headers = {"activemq.subscriptionName": args.durable_name} if args.durable else {}
+            conn.subscribe(
+                destination=args.topic,
+                id=args.subscription_id,
+                ack="client-individual",
+                headers=subscribe_headers,
+            )
+            print("[STOMP] subscribed with client-individual acknowledgement")
 
             last_status = time.time()
             while conn.is_connected() and not stop_event.is_set():
                 learner.tick()
                 if time.time() - last_status >= args.status_every:
                     last_status = time.time()
-                    print(f"[STATUS] {fmt_ts(time.time())} messages={listener.messages} pending={len(learner.pending)} recent_s={len(learner.recent_events)}")
+                    message_count = listener.messages if listener is not None else 0
+                    print(f"[STATUS] {fmt_ts(time.time())} messages={message_count} pending={len(learner.pending)} recent_s={len(learner.recent_events)} snapshot_valid={learner.snapshot_valid} generation={learner.snapshot_generation}")
                 time.sleep(0.5)
 
         except Exception as exc:
@@ -2162,6 +3490,10 @@ def run_live(args: argparse.Namespace, learner: Learner) -> None:
             if args.debug_tracebacks:
                 traceback.print_exc()
         finally:
+            try:
+                learner.mark_feed_gap("live CLI connection ended")
+            except Exception:
+                pass
             try:
                 if conn is not None and conn.is_connected():
                     conn.disconnect()
@@ -2275,6 +3607,10 @@ def add_live_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--topic", default="/topic/TD_ALL_SIG_AREA")
     p.add_argument("--heartbeat-ms", type=int, default=10000)
     p.add_argument("--subscription-id", default="t3-clean-learner")
+    p.add_argument("--client-id", default="", help="Durable client-id. Defaults to the NROD username/email.")
+    p.add_argument("--durable-name", default="t3-clean-learner")
+    p.add_argument("--durable", action=argparse.BooleanOptionalAction, default=True,
+                   help="Use a durable ActiveMQ topic subscription (default: true).")
     p.add_argument("--status-every", type=float, default=60.0)
     p.add_argument("--reconnect-delay", type=float, default=10.0)
     p.add_argument("--max-reconnect-delay", type=float, default=300.0)
@@ -2381,41 +3717,90 @@ def cmd_report(args: argparse.Namespace) -> int:
     if not signals:
         raise SystemExit("Use report --all or report --signals 6232,6239")
     try:
-        for s in sorted(signals):
-            min_pct = float(args.min_pct) / 100.0 if float(args.min_pct) > 1.0 else float(args.min_pct)
-            print_signal_report(
-                store,
-                known,
-                s,
-                score_window=args.score_window,
-                show_known=args.show_known,
-                show_cross_known=bool(getattr(args, "show_cross_known", False)),
-                min_pct=min_pct,
-                min_pass_count=max(1, int(getattr(args, "min_pass_count", 1))),
-                max_avg_delta=getattr(args, "max_avg_delta", None),
-                limit=int(args.limit),
+        for signal_id in sorted(signals):
+            print(f"[PROTOCOL-REPORT] signal/berth {signal_id}")
+            print("  CA is treated as a berth step; only SF rows are used as timed S-Class edges.")
+            mapped = sorted(known.keys_for_signal(signal_id), key=lambda k: (int(k.address, 16), k.bit))
+            if mapped:
+                print("  CSV/reference mappings:")
+                for key in mapped:
+                    for row in known.by_key.get(key, []):
+                        print(f"    {key.label}: {row.summary()}")
+            else:
+                print("  CSV/reference mappings: none")
+
+            rows = protocol_candidate_analysis(
+                store.conn,
+                signal_id,
+                area=args.area,
+                max_steps=max(10, min(1000, int(getattr(args, "limit", 250)) * 20)),
             )
+            for classification, title in [
+                ("movement_pulse", "Rejected movement/track-shaped pulses"),
+                ("pre_step_control", "Pre-step controls (signal OR route)"),
+                ("correlated_control", "Weaker/general correlations"),
+            ]:
+                group = [r for r in rows if r["classification"] == classification]
+                print(f"  {title}:")
+                if not group:
+                    print("    none")
+                    continue
+                for row in group[: max(1, int(getattr(args, "limit", 12)))]:
+                    lead = "?" if row["median_lead"] is None else f"{row['median_lead']:.1f}s"
+                    pulse = "?" if row["median_pulse"] is None else f"{row['median_pulse']:.1f}s"
+                    print(
+                        f"    {row['key'].label}: {row['direction']} target_steps={row['target_steps']} "
+                        f"pre={row['pre_hits']} ({row['pre_rate']*100:.0f}%) "
+                        f"cycles={row['cycle_hits']} ({row['cycle_rate']*100:.0f}%) "
+                        f"near={row['near_hits']} ({row['near_rate']*100:.0f}%) "
+                        f"lead={lead} pulse={pulse} control={row['control_rate']*100:.0f}% "
+                        f"lift={row['lift']*100:+.0f}pp"
+                    )
+                    print(f"      {row['explanation']}")
+            manual = manual_observation_candidates(store.conn, signal_id)
+            print("  Paired physical observations:")
+            if not manual:
+                print("    none/insufficient")
+            for row in manual[: max(1, int(getattr(args, "limit", 12)))]:
+                print(
+                    f"    {row['key'].label}: RED->OFF {row['direction']} "
+                    f"support={row['support']}/{row['pair_count']} "
+                    f"consistency={row['consistency']*100:.0f}% return={row['return_rate']*100:.0f}%"
+                )
+            print("  No automated candidate is promoted to RED/OFF without verified provenance and polarity.")
     finally:
         store.close()
     return 0
 
 
-
 def cmd_progress(args: argparse.Namespace) -> int:
     store, topology, known = build_common(args)
     try:
-        min_pct = float(args.min_pct) / 100.0 if float(args.min_pct) > 1.0 else float(args.min_pct)
-        print_progress_report(
-            store,
-            topology,
-            known,
-            score_window=float(args.score_window),
-            min_pct=min_pct,
-            min_pass_count=max(1, int(args.min_pass_count)),
-            max_avg_delta=getattr(args, "max_avg_delta", None),
-            limit=max(1, int(args.limit)),
-            include_known=bool(getattr(args, "show_known", False)),
-        )
+        state = store.feed_state_row(args.area)
+        valid = bool(state and int(state["snapshot_valid"] or 0))
+        print("[PROTOCOL-PROGRESS] T3 ingestion and evidence summary")
+        print(f"  topology entries: {len(topology)}")
+        print(f"  snapshot valid: {valid}")
+        if state:
+            print(f"  snapshot generation: {int(state['snapshot_generation'] or 0)}")
+            print(f"  refresh in progress: {bool(int(state['refresh_in_progress'] or 0))}")
+            print(f"  last complete refresh: {fmt_ts(float(state['last_complete_refresh_ts'])) if state['last_complete_refresh_ts'] is not None else 'never'}")
+            print(f"  invalid messages: {int(state['invalid_messages'] or 0)}")
+            print(f"  duplicate messages ignored: {int(state['duplicate_messages'] or 0)}")
+            print(f"  reason: {state['last_reason'] or '-'}")
+        for table in [
+            "raw_td_messages", "berth_steps", "s_bit_events", "s_snapshot_differences",
+            "signal_observation_sessions", "signal_observations", "pass_log", "pass_bit_events",
+        ]:
+            exists = store.conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+            ).fetchone()
+            count = store.conn.execute(f"SELECT COUNT(*) AS c FROM {table}").fetchone()["c"] if exists else 0
+            print(f"  {table}: {int(count):,}")
+        verified = sum(1 for row in known.rows if row.trusted_for_live_aspect)
+        reference = sum(1 for row in known.rows if row.described and not row.trusted_for_live_aspect)
+        print(f"  known mappings: {len(known.rows)} total, {verified} verified live-aspect, {reference} reference-only")
+        print("  legacy pass windows are retained for diagnostics only and are not aspect proof")
     finally:
         store.close()
     return 0

@@ -17,6 +17,7 @@ import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional
+from zoneinfo import ZoneInfo
 
 import discord
 from discord import app_commands
@@ -27,6 +28,8 @@ import t3_learner_clean as learner_mod
 
 load_dotenv("/etc/metro-bot.env")
 load_dotenv()
+
+UK_TIMEZONE = ZoneInfo("Europe/London")
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -69,13 +72,13 @@ def stamp() -> str:
 def fmt_ts(ts: Optional[float]) -> str:
     if not ts:
         return "never"
-    return dt.datetime.fromtimestamp(float(ts)).strftime("%Y-%m-%d %H:%M:%S")
+    return dt.datetime.fromtimestamp(float(ts), UK_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
 def short_ts(ts: Optional[float]) -> str:
     if not ts:
         return "never"
-    return dt.datetime.fromtimestamp(float(ts)).strftime("%H:%M:%S")
+    return dt.datetime.fromtimestamp(float(ts), UK_TIMEZONE).strftime("%H:%M:%S")
 
 
 def uptime_text(start_ts: float) -> str:
@@ -120,6 +123,11 @@ class Config:
     nr_topic: str
     nr_username: str
     nr_password: str
+    nr_subscription_id: str
+    nr_client_id: str
+    nr_durable_name: str
+    nr_durable: bool
+    nr_snapshot_stale_seconds: float
     cli_timeout_seconds: int
     cli_concurrency: int
     db_busy_timeout_ms: int
@@ -161,6 +169,11 @@ def load_config() -> Config:
         nr_topic=os.getenv("NR_TOPIC", "/topic/TD_ALL_SIG_AREA").strip(),
         nr_username=os.getenv("NROD_USER") or os.getenv("NR_USERNAME", ""),
         nr_password=os.getenv("NROD_PASS") or os.getenv("NR_PASSWORD", ""),
+        nr_subscription_id=os.getenv("NR_SUBSCRIPTION_ID", "metro-nr-bot-t3").strip(),
+        nr_client_id=(os.getenv("NR_CLIENT_ID") or os.getenv("NROD_USER") or os.getenv("NR_USERNAME", "")).strip(),
+        nr_durable_name=os.getenv("NR_DURABLE_NAME", "metro-nr-bot-t3").strip(),
+        nr_durable=env_bool("NR_DURABLE_SUBSCRIPTION", True),
+        nr_snapshot_stale_seconds=env_float("NR_SNAPSHOT_STALE_SECONDS", 600.0, minimum=30.0, maximum=86400.0),
         cli_timeout_seconds=env_int("NR_CLI_TIMEOUT_SECONDS", 60, minimum=10, maximum=600),
         cli_concurrency=env_int("NR_CLI_CONCURRENCY", 1, minimum=1, maximum=4),
         db_busy_timeout_ms=env_int("NR_DB_BUSY_TIMEOUT_MS", 5000, minimum=250, maximum=60000),
@@ -202,7 +215,7 @@ def ensure_dirs() -> None:
 
     if not CFG.known_path.exists():
         CFG.known_path.write_text(
-            "Address:Bit,Element type,Description,Signal,Route From,Route To,Active State,Ignore In Tracker,Confidence,Notes\n",
+            "Address:Bit,Element type,Description,Signal,Route From,Route To,Active State,Ignore In Tracker,Confidence,Notes,Provenance,Verified,Element Group\n",
             encoding="utf-8",
         )
 
@@ -396,6 +409,7 @@ def current_bit_value(conn: sqlite3.Connection, key: learner_mod.BitKey) -> tupl
             SELECT event_ts, new_bit, msg_type
             FROM s_bit_events
             WHERE area=? AND address=? AND bit=?
+              AND UPPER(COALESCE(msg_type,''))='SF'
             ORDER BY event_ts DESC
             LIMIT 1
             """,
@@ -423,7 +437,7 @@ def _active_state_text(active_state: str, raw_value: int) -> str | None:
     # Accept common ways of writing the CSV polarity, e.g. "red=1", "1=red",
     # "proceed=1", "active high proceed", or simply "red" / "proceed".
     red_words = {"red", "danger", "on"}
-    proceed_words = {"proceed", "clear", "cleared", "off", "route", "set"}
+    proceed_words = {"proceed", "clear", "cleared", "off"}
 
     def has_any(words: set[str]) -> bool:
         return any(w in text for w in words)
@@ -438,8 +452,74 @@ def _active_state_text(active_state: str, raw_value: int) -> str | None:
     if has_any(red_words):
         return "red/danger" if raw_value == active_value else "not red/cleared"
     if has_any(proceed_words):
-        return "proceed/route set" if raw_value == active_value else "not proved proceed"
+        return "proceed/off indication" if raw_value == active_value else "not proved proceed/off"
     return None
+
+
+def feed_snapshot_status(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Return whether the current S-Class snapshot is safe to present as live."""
+    if not table_exists(conn, "feed_state"):
+        return {
+            "valid": False,
+            "generation": 0,
+            "last_refresh": None,
+            "last_s_event": None,
+            "last_c_event": None,
+            "last_feed_event": None,
+            "reason": "database predates protocol-level feed state",
+            "refresh_in_progress": False,
+        }
+    row = conn.execute("SELECT * FROM feed_state WHERE area=?", (CFG.nr_area,)).fetchone()
+    if row is None:
+        return {
+            "valid": False,
+            "generation": 0,
+            "last_refresh": None,
+            "last_s_event": None,
+            "last_c_event": None,
+            "last_feed_event": None,
+            "reason": "waiting for first complete SG...SH refresh",
+            "refresh_in_progress": False,
+        }
+    last_s = float(row["last_s_event_ts"]) if row["last_s_event_ts"] is not None else None
+    last_c = float(row["last_c_event_ts"]) if row["last_c_event_ts"] is not None else None
+    feed_times = [value for value in (last_s, last_c) if value is not None]
+    last_feed_event = max(feed_times) if feed_times else None
+    valid = bool(int(row["snapshot_valid"] or 0))
+    reason = str(row["last_reason"] or "")
+    if valid and last_feed_event is None:
+        valid = False
+        reason = "snapshot has no subsequent TD heartbeat/event timestamp"
+    elif valid and time.time() - last_feed_event > CFG.nr_snapshot_stale_seconds:
+        valid = False
+        reason = (
+            f"last TD event/heartbeat is {time.time() - last_feed_event:.0f}s old; "
+            f"stale threshold is {CFG.nr_snapshot_stale_seconds:.0f}s"
+        )
+    return {
+        "valid": valid,
+        "generation": int(row["snapshot_generation"] or 0),
+        "last_refresh": float(row["last_complete_refresh_ts"]) if row["last_complete_refresh_ts"] is not None else None,
+        "last_s_event": last_s,
+        "last_c_event": last_c,
+        "last_feed_event": last_feed_event,
+        "reason": reason,
+        "refresh_in_progress": bool(int(row["refresh_in_progress"] or 0)),
+        "invalid_messages": int(row["invalid_messages"] or 0),
+        "duplicate_messages": int(row["duplicate_messages"] or 0),
+    }
+
+
+def trusted_live_mapping_rows(
+    known: learner_mod.KnownBits,
+    key: learner_mod.BitKey,
+    signal_id: str | None = None,
+) -> list[learner_mod.KnownBit]:
+    rows = [row for row in known.by_key.get(key, []) if row.trusted_for_live_aspect]
+    if signal_id is None:
+        return rows
+    signal_norm = learner_mod.normalize_berth(signal_id)
+    return [row for row in rows if signal_norm in known._signals_for_row(row)]
 
 
 def describe_raw_bit_state(known: learner_mod.KnownBits, key: learner_mod.BitKey, raw_value: int | None) -> str:
@@ -588,6 +668,7 @@ def recent_bit_change_count(conn: sqlite3.Connection, key: learner_mod.BitKey, *
         SELECT COUNT(*) AS c
         FROM s_bit_events
         WHERE area=? AND address=? AND bit=? AND event_ts >= ?
+          AND UPPER(COALESCE(msg_type,''))='SF'
         """,
         (CFG.nr_area, int(key.address, 16), int(key.bit), time.time() - float(seconds)),
     ).fetchone()
@@ -595,34 +676,49 @@ def recent_bit_change_count(conn: sqlite3.Connection, key: learner_mod.BitKey, *
 
 
 def recent_moves_for_berth(conn: sqlite3.Connection, berth: str, *, limit: int = 3) -> list[sqlite3.Row]:
+    b = learner_mod.normalize_berth(berth)
+    if table_exists(conn, "berth_steps"):
+        return list(conn.execute(
+            """
+            SELECT event_ts AS pass_ts, from_berth AS signal, from_berth, to_berth,
+                   descr, event_ts AS finalised_ts
+            FROM berth_steps
+            WHERE from_berth=? OR to_berth=?
+            ORDER BY event_ts DESC LIMIT ?
+            """,
+            (b, b, int(limit)),
+        ).fetchall())
     if not table_exists(conn, "pass_log"):
         return []
-    b = learner_mod.normalize_berth(berth)
     return list(conn.execute(
         """
         SELECT pass_ts, signal, from_berth, to_berth, descr, finalised_ts
         FROM pass_log
         WHERE signal=? OR from_berth=? OR to_berth=?
-        ORDER BY pass_ts DESC
-        LIMIT ?
+        ORDER BY pass_ts DESC LIMIT ?
         """,
         (b, b, b, int(limit)),
     ).fetchall())
 
 
-
-
 def recent_signal_move_count(conn: sqlite3.Connection, signal_id: str, *, seconds: float) -> int:
-    """Count recent C-Class/pass-log moves involving one signal/berth."""
+    """Count recent canonical C-Class berth steps involving one berth."""
+    sig = learner_mod.normalize_berth(signal_id)
+    if table_exists(conn, "berth_steps"):
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS c FROM berth_steps
+            WHERE (from_berth=? OR to_berth=?) AND event_ts >= ?
+            """,
+            (sig, sig, time.time() - float(seconds)),
+        ).fetchone()
+        return int(row["c"] if row else 0)
     if not table_exists(conn, "pass_log"):
         return 0
-    sig = learner_mod.normalize_berth(signal_id)
     row = conn.execute(
         """
-        SELECT COUNT(*) AS c
-        FROM pass_log
-        WHERE (signal=? OR from_berth=? OR to_berth=?)
-          AND pass_ts >= ?
+        SELECT COUNT(*) AS c FROM pass_log
+        WHERE (signal=? OR from_berth=? OR to_berth=?) AND pass_ts >= ?
         """,
         (sig, sig, sig, time.time() - float(seconds)),
     ).fetchone()
@@ -636,20 +732,33 @@ def nearest_pass_for_signal(
     *,
     window_seconds: float,
 ) -> sqlite3.Row | None:
-    """Nearest stored CA/pass for a signal around an S-Class bit flip."""
+    """Nearest canonical CA berth step from a selected from-berth.
+
+    The legacy function name is retained for compatibility. The returned time
+    is a berth-step time, not an independently proven physical signal pass.
+    """
+    sig = learner_mod.normalize_berth(signal_id)
+    if table_exists(conn, "berth_steps"):
+        return conn.execute(
+            """
+            SELECT from_berth AS signal, from_berth, to_berth, descr,
+                   event_ts AS pass_ts, event_ts - ? AS delta_seconds,
+                   ABS(event_ts - ?) AS abs_delta
+            FROM berth_steps
+            WHERE from_berth=? AND ABS(event_ts - ?) <= ?
+            ORDER BY ABS(event_ts - ?), event_ts DESC LIMIT 1
+            """,
+            (float(event_ts), float(event_ts), sig, float(event_ts), float(window_seconds), float(event_ts)),
+        ).fetchone()
     if not table_exists(conn, "pass_log"):
         return None
-    sig = learner_mod.normalize_berth(signal_id)
     return conn.execute(
         """
-        SELECT signal, from_berth, to_berth, descr, pass_ts,
-               pass_ts - ? AS delta_seconds,
-               ABS(pass_ts - ?) AS abs_delta
+        SELECT signal,from_berth,to_berth,descr,pass_ts,
+               pass_ts - ? AS delta_seconds,ABS(pass_ts - ?) AS abs_delta
         FROM pass_log
-        WHERE signal=?
-          AND ABS(pass_ts - ?) <= ?
-        ORDER BY ABS(pass_ts - ?), pass_ts DESC
-        LIMIT 1
+        WHERE signal=? AND ABS(pass_ts - ?) <= ?
+        ORDER BY ABS(pass_ts - ?), pass_ts DESC LIMIT 1
         """,
         (float(event_ts), float(event_ts), sig, float(event_ts), float(window_seconds), float(event_ts)),
     ).fetchone()
@@ -671,6 +780,7 @@ def bit_signal_correlation_counts(
         SELECT event_ts
         FROM s_bit_events
         WHERE area=? AND address=? AND bit=? AND event_ts >= ?
+          AND UPPER(COALESCE(msg_type,''))='SF'
         ORDER BY event_ts DESC
         """,
         (CFG.nr_area, int(key.address, 16), int(key.bit), time.time() - float(seconds)),
@@ -724,14 +834,16 @@ def bit_global_correlation_rows(
     match_window_seconds: float,
     limit: int,
 ) -> tuple[int, list[dict[str, Any]]]:
-    """Find which signals/berths most often move near raw bit changes.
+    """Exploratory correlation against canonical berth steps.
 
-    This is intentionally broader than /bit_trace. /bit_trace answers
-    "does this bit fit one signal?"; this scan answers "which signal/berth does
-    this bit fit best?" by comparing each raw S-Class bit flip with every
-    C-Class/pass_log movement in the chosen time window.
+    This deliberately remains a ranking tool, not a signal-aspect learner.
+    Only precisely timed SF edges are included; historical SG/SH refresh rows
+    from older database versions are ignored.
     """
-    if not table_exists(conn, "s_bit_events") or not table_exists(conn, "pass_log"):
+    if not table_exists(conn, "s_bit_events"):
+        return 0, []
+    use_steps = table_exists(conn, "berth_steps")
+    if not use_steps and not table_exists(conn, "pass_log"):
         return 0, []
 
     since_ts = time.time() - float(seconds)
@@ -740,6 +852,7 @@ def bit_global_correlation_rows(
         SELECT COUNT(*) AS c
         FROM s_bit_events
         WHERE area=? AND address=? AND bit=? AND event_ts >= ?
+          AND UPPER(COALESCE(msg_type,''))='SF'
         """,
         (CFG.nr_area, int(key.address, 16), int(key.bit), since_ts),
     ).fetchone()
@@ -747,63 +860,56 @@ def bit_global_correlation_rows(
     if total_changes <= 0:
         return 0, []
 
-    # Aggregate by candidate berth and by how that berth appeared in the move.
-    # delta_seconds is pass_ts - bit_event_ts, so positive means the bit changed
-    # before the CA move; negative means the bit changed after the CA move.
-    rows = conn.execute(
-        """
+    step_cte = (
+        "SELECT id,from_berth AS signal,from_berth,to_berth,descr,event_ts AS pass_ts "
+        "FROM berth_steps WHERE area='" + CFG.nr_area.replace("'", "''") + "'"
+        if use_steps else
+        "SELECT id,signal,from_berth,to_berth,descr,pass_ts FROM pass_log"
+    )
+    sql = f"""
         WITH bit_events AS (
-            SELECT id, event_ts, old_bit, new_bit
+            SELECT id,event_ts,old_bit,new_bit
             FROM s_bit_events
             WHERE area=? AND address=? AND bit=? AND event_ts >= ?
+              AND UPPER(COALESCE(msg_type,''))='SF'
+        ), steps AS (
+            {step_cte}
         ), nearby AS (
-            SELECT e.id AS event_id,
-                   e.event_ts AS bit_ts,
-                   e.old_bit AS old_bit,
-                   e.new_bit AS new_bit,
-                   p.id AS pass_id,
-                   p.signal AS signal,
-                   p.from_berth AS from_berth,
-                   p.to_berth AS to_berth,
-                   p.descr AS descr,
-                   p.pass_ts AS pass_ts,
-                   (p.pass_ts - e.event_ts) AS delta_seconds
+            SELECT e.id AS event_id,e.event_ts AS bit_ts,e.old_bit,e.new_bit,
+                   p.id AS pass_id,p.signal,p.from_berth,p.to_berth,p.descr,p.pass_ts,
+                   (p.pass_ts-e.event_ts) AS delta_seconds
             FROM bit_events e
-            JOIN pass_log p
-              ON p.pass_ts BETWEEN e.event_ts - ? AND e.event_ts + ?
+            JOIN steps p ON p.pass_ts BETWEEN e.event_ts-? AND e.event_ts+?
         ), roles AS (
-            SELECT event_id, pass_id, 'signal' AS role, signal AS candidate,
-                   from_berth, to_berth, descr, delta_seconds, old_bit, new_bit
-            FROM nearby
-            WHERE signal IS NOT NULL AND signal <> ''
+            SELECT event_id,pass_id,'signal' AS role,signal AS candidate,
+                   from_berth,to_berth,descr,delta_seconds,old_bit,new_bit
+            FROM nearby WHERE signal IS NOT NULL AND signal<>''
             UNION ALL
-            SELECT event_id, pass_id, 'from' AS role, from_berth AS candidate,
-                   from_berth, to_berth, descr, delta_seconds, old_bit, new_bit
-            FROM nearby
-            WHERE from_berth IS NOT NULL AND from_berth <> ''
+            SELECT event_id,pass_id,'from' AS role,from_berth AS candidate,
+                   from_berth,to_berth,descr,delta_seconds,old_bit,new_bit
+            FROM nearby WHERE from_berth IS NOT NULL AND from_berth<>''
             UNION ALL
-            SELECT event_id, pass_id, 'to' AS role, to_berth AS candidate,
-                   from_berth, to_berth, descr, delta_seconds, old_bit, new_bit
-            FROM nearby
-            WHERE to_berth IS NOT NULL AND to_berth <> ''
+            SELECT event_id,pass_id,'to' AS role,to_berth AS candidate,
+                   from_berth,to_berth,descr,delta_seconds,old_bit,new_bit
+            FROM nearby WHERE to_berth IS NOT NULL AND to_berth<>''
         )
-        SELECT candidate,
-               role,
-               COUNT(*) AS match_rows,
+        SELECT candidate,role,COUNT(*) AS match_rows,
                COUNT(DISTINCT event_id) AS matched_changes,
                COUNT(DISTINCT pass_id) AS matched_moves,
                AVG(ABS(delta_seconds)) AS avg_abs_delta,
                AVG(delta_seconds) AS avg_signed_delta,
-               SUM(CASE WHEN delta_seconds >= 0 THEN 1 ELSE 0 END) AS before_move_rows,
-               SUM(CASE WHEN delta_seconds < 0 THEN 1 ELSE 0 END) AS after_move_rows,
+               SUM(CASE WHEN delta_seconds>=0 THEN 1 ELSE 0 END) AS before_move_rows,
+               SUM(CASE WHEN delta_seconds<0 THEN 1 ELSE 0 END) AS after_move_rows,
                SUM(CASE WHEN old_bit=0 AND new_bit=1 THEN 1 ELSE 0 END) AS up_rows,
                SUM(CASE WHEN old_bit=1 AND new_bit=0 THEN 1 ELSE 0 END) AS down_rows,
                GROUP_CONCAT(DISTINCT from_berth || '->' || to_berth) AS routes
         FROM roles
-        GROUP BY candidate, role
-        ORDER BY matched_changes DESC, matched_moves DESC, avg_abs_delta ASC, candidate ASC
+        GROUP BY candidate,role
+        ORDER BY matched_changes DESC,matched_moves DESC,avg_abs_delta ASC,candidate ASC
         LIMIT ?
-        """,
+    """
+    rows = conn.execute(
+        sql,
         (
             CFG.nr_area,
             int(key.address, 16),
@@ -820,44 +926,28 @@ def bit_global_correlation_rows(
         candidate = learner_mod.normalize_berth(row["candidate"])
         movement_count = recent_signal_move_count(conn, candidate, seconds=seconds)
         matched_changes = int(row["matched_changes"] or 0)
-        match_pct = (matched_changes / total_changes) if total_changes else 0.0
-        coverage_pct = (matched_changes / movement_count) if movement_count else 0.0
         before_rows = int(row["before_move_rows"] or 0)
         after_rows = int(row["after_move_rows"] or 0)
-        if before_rows > after_rows:
-            timing = "mostly before move"
-        elif after_rows > before_rows:
-            timing = "mostly after move"
-        else:
-            timing = "mixed timing"
         up_rows = int(row["up_rows"] or 0)
         down_rows = int(row["down_rows"] or 0)
-        if up_rows > down_rows:
-            edge = "mostly 0->1"
-        elif down_rows > up_rows:
-            edge = "mostly 1->0"
-        else:
-            edge = "mixed edges"
-        routes_raw = str(row["routes"] or "")
-        routes = [x for x in routes_raw.split(",") if x]
-        out.append(
-            {
-                "candidate": candidate,
-                "role": str(row["role"] or "?"),
-                "matched_changes": matched_changes,
-                "matched_moves": int(row["matched_moves"] or 0),
-                "match_rows": int(row["match_rows"] or 0),
-                "movement_count": int(movement_count),
-                "match_pct": match_pct,
-                "coverage_pct": coverage_pct,
-                "avg_abs_delta": float(row["avg_abs_delta"] or 0.0),
-                "avg_signed_delta": float(row["avg_signed_delta"] or 0.0),
-                "timing": timing,
-                "edge": edge,
-                "routes": routes[:4],
-            }
-        )
+        routes = [x for x in str(row["routes"] or "").split(",") if x]
+        out.append({
+            "candidate": candidate,
+            "role": str(row["role"] or "?"),
+            "matched_changes": matched_changes,
+            "matched_moves": int(row["matched_moves"] or 0),
+            "match_rows": int(row["match_rows"] or 0),
+            "movement_count": movement_count,
+            "match_pct": matched_changes / total_changes if total_changes else 0.0,
+            "coverage_pct": matched_changes / movement_count if movement_count else 0.0,
+            "avg_abs_delta": float(row["avg_abs_delta"] or 0.0),
+            "avg_signed_delta": float(row["avg_signed_delta"] or 0.0),
+            "timing": "mostly before step" if before_rows > after_rows else "mostly after step" if after_rows > before_rows else "mixed timing",
+            "edge": "mostly 0->1" if up_rows > down_rows else "mostly 1->0" if down_rows > up_rows else "mixed edges",
+            "routes": routes[:4],
+        })
     return total_changes, out
+
 
 def signal_bit_interpretation_line(
     conn: sqlite3.Connection,
@@ -907,16 +997,39 @@ STATUS = Status()
 
 
 class DiscordFeedListener:
-    def __init__(self, learner: learner_mod.Learner):
+    def __init__(self, learner: learner_mod.Learner, connection: Any, subscription_id: str):
         self.learner = learner
+        self.connection = connection
+        self.subscription_id = subscription_id
+
+    @staticmethod
+    def _ack_id(frame: Any) -> str:
+        headers = getattr(frame, "headers", {}) or {}
+        return str(headers.get("ack") or headers.get("message-id") or "")
 
     def on_message(self, frame: Any) -> None:
         with STATUS.lock:
             STATUS.nr_messages += 1
             STATUS.nr_last_message_ts = time.time()
+        ack_id = self._ack_id(frame)
         try:
-            for key, payload in learner_mod.iter_message_objects(frame.body):
+            messages = list(learner_mod.iter_message_objects(frame.body))
+            for key, payload in messages:
                 self.learner.handle_message(key, payload)
+            # STOMP 1.2 ACK uses the MESSAGE frame's `ack` id. Acknowledge only
+            # after every inner TD message has been committed; database failures
+            # therefore remain eligible for durable redelivery.
+            if ack_id:
+                self.connection.ack(id=ack_id)
+        except learner_mod.InvalidTDMessage as exc:
+            # A permanently malformed poison frame would otherwise block the
+            # durable subscription forever. Record it, then consume it.
+            self.learner.store.mark_invalid_message(self.learner.area, f"STOMP frame: {exc}")
+            with STATUS.lock:
+                STATUS.nr_last_error = f"Malformed TD frame discarded: {exc}"
+            if ack_id:
+                with contextlib.suppress(Exception):
+                    self.connection.ack(id=ack_id)
         except Exception:
             with STATUS.lock:
                 STATUS.nr_last_error = traceback.format_exc()
@@ -926,6 +1039,7 @@ class DiscordFeedListener:
             STATUS.nr_last_error = f"{getattr(frame, 'headers', {})} {getattr(frame, 'body', '')}"
 
     def on_disconnected(self) -> None:
+        self.learner.mark_feed_gap("STOMP disconnected; waiting for a new complete refresh")
         with STATUS.lock:
             STATUS.nr_connected = False
             STATUS.nr_last_disconnect_ts = time.time()
@@ -1002,20 +1116,37 @@ class NRFeedService:
 
         while not self.stop_event.is_set():
             store_to_close = None
+            live_learner: learner_mod.Learner | None = None
             connected_at: float | None = None
             try:
                 live_learner = self._make_learner()
                 store_to_close = live_learner.store
-                listener = DiscordFeedListener(live_learner)
                 conn = learner_mod.stomp.Connection12(
                     host_and_ports=[(CFG.nr_host, CFG.nr_port)],
                     keepalive=True,
                     heartbeats=(10000, 10000),
                 )
                 self.conn = conn
+                listener = DiscordFeedListener(live_learner, conn, CFG.nr_subscription_id)
                 conn.set_listener("discord-t3-learner", listener)
-                conn.connect(username=CFG.nr_username, passcode=CFG.nr_password, wait=True)
-                conn.subscribe(destination=CFG.nr_topic, id="discord-t3-learner", ack="auto")
+                connect_headers = {"client-id": CFG.nr_client_id} if CFG.nr_durable else {}
+                conn.connect(
+                    username=CFG.nr_username,
+                    passcode=CFG.nr_password,
+                    wait=True,
+                    headers=connect_headers,
+                )
+                live_learner.mark_connected()
+                subscribe_headers = (
+                    {"activemq.subscriptionName": CFG.nr_durable_name}
+                    if CFG.nr_durable else {}
+                )
+                conn.subscribe(
+                    destination=CFG.nr_topic,
+                    id=CFG.nr_subscription_id,
+                    ack="client-individual",
+                    headers=subscribe_headers,
+                )
 
                 connected_at = time.time()
                 delay = CFG.nr_reconnect_initial_seconds
@@ -1033,6 +1164,11 @@ class NRFeedService:
                     STATUS.nr_last_error = traceback.format_exc()
                     STATUS.nr_connected = False
             finally:
+                with contextlib.suppress(Exception):
+                    if live_learner is not None:
+                        live_learner.mark_feed_gap(
+                            "feed stopped" if self.stop_event.is_set() else "connection ended"
+                        )
                 with contextlib.suppress(Exception):
                     if self.conn is not None and self.conn.is_connected():
                         self.conn.disconnect()
@@ -1103,7 +1239,12 @@ async def status_cmd(interaction: discord.Interaction) -> None:
         known_count = 0
 
     db_size = CFG.db_path.stat().st_size if CFG.db_path.exists() else 0
-    embed = discord.Embed(title="T3 Learner Bot Status", color=0x2ECC71 if nr_connected else 0xE67E22)
+    snapshot_info: dict[str, Any] = {"valid": False, "reason": "database unavailable"}
+    if CFG.db_path.exists():
+        with contextlib.suppress(Exception):
+            with db_connect(readonly=True) as conn:
+                snapshot_info = feed_snapshot_status(conn)
+    embed = discord.Embed(title="T3 Protocol Bot Status", color=0x2ECC71 if nr_connected and snapshot_info.get("valid") else 0xE67E22)
     embed.add_field(
         name="Discord/runtime",
         value=(
@@ -1125,6 +1266,20 @@ async def status_cmd(interaction: discord.Interaction) -> None:
             f"Last message: `{fmt_ts(nr_last_message_ts)}`\n"
             f"Last connect: `{fmt_ts(nr_last_connect_ts)}`\n"
             f"Last connected duration: `{nr_last_duration:.0f}s`" if nr_last_duration else "Last connected duration: `n/a`"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="S-Class snapshot",
+        value=(
+            f"Live valid: `{snapshot_info.get('valid', False)}`\n"
+            f"Generation: `{snapshot_info.get('generation', 0)}`\n"
+            f"Refresh in progress: `{snapshot_info.get('refresh_in_progress', False)}`\n"
+            f"Last complete refresh: `{fmt_ts(snapshot_info.get('last_refresh'))}`\n"
+            f"Last S event: `{fmt_ts(snapshot_info.get('last_s_event'))}`\n"
+            f"Invalid messages: `{snapshot_info.get('invalid_messages', 0)}`\n"
+            f"Duplicate deliveries ignored: `{snapshot_info.get('duplicate_messages', 0)}`\n"
+            f"Reason: `{trim(str(snapshot_info.get('reason') or '-'), 300)}`"
         ),
         inline=False,
     )
@@ -1167,51 +1322,147 @@ async def nr_restart_cmd(interaction: discord.Interaction) -> None:
     await send_text(interaction, stopped + "\n" + started)
 
 
-@bot.tree.command(name="report", description="Show learner evidence report for a signal.")
+@bot.tree.command(name="report", description="Show protocol-level S-Class evidence for a signal/berth.")
 @app_commands.describe(
-    signal="Signal/berth, e.g. 6232",
-    show_known="Audit this signal's known CSV bits",
-    show_cross_known="Also show known bits belonging to other signals in the pass window",
-    min_pass_count="Minimum supporting pass hits to show a candidate",
-    min_pct="Minimum consistency percent, e.g. 80",
-    max_avg_delta="Maximum average timing delta in seconds; 0 disables this filter",
+    signal="Signal/berth, e.g. 6239",
+    max_steps="Maximum recent canonical CA berth steps to analyse",
+    limit="Maximum candidates per classification",
 )
 async def report_cmd(
     interaction: discord.Interaction,
     signal: str,
-    show_known: bool = True,
-    show_cross_known: bool = False,
-    min_pass_count: int = 3,
-    min_pct: float = 80.0,
-    max_avg_delta: float = 3.0,
+    max_steps: int = 250,
+    limit: int = 10,
 ) -> None:
     await interaction.response.defer()
-    args = cli_args("report") + [
-        "--signals", signal,
-        "--min-pass-count", str(max(1, int(min_pass_count))),
-        "--min-pct", str(float(min_pct)),
-    ]
-    if float(max_avg_delta) > 0:
-        args += ["--max-avg-delta", str(float(max_avg_delta))]
-    if show_known:
-        args.append("--show-known")
-    if show_cross_known:
-        args.append("--show-cross-known")
+    sig = learner_mod.normalize_berth(signal)
     try:
-        text = await run_cli_async(args)
+        with db_connect(readonly=True) as conn:
+            rows = learner_mod.protocol_candidate_analysis(
+                conn, sig, area=CFG.nr_area,
+                max_steps=max(10, min(int(max_steps), 1000)),
+            )
+            manual = learner_mod.manual_observation_candidates(conn, sig) if table_exists(conn, "signal_observation_sessions") else []
+        known = known_bits()
+        mapped = sorted(known.keys_for_signal(sig), key=lambda k: (int(k.address, 16), k.bit))
+        lines = [f"Protocol evidence report for signal/berth {sig}"]
+        lines.append(
+            "CA timestamps are treated as berth-step times, not exact physical signal-passage times. "
+            "SG/SH refresh differences are excluded from timed-edge learning; only SF edges are analysed."
+        )
+        if mapped:
+            lines.append("CSV/reference mappings:")
+            for key in mapped:
+                for row in known.by_key.get(key, []):
+                    lines.append(f"  {key.label}: {row.summary()}")
+        else:
+            lines.append("CSV/reference mappings: none")
+
+        groups = [
+            ("movement_pulse", "Rejected movement/track-shaped pulses"),
+            ("pre_step_control", "Pre-step control cycles (signal OR route candidates)"),
+            ("correlated_control", "Weaker/general correlations"),
+        ]
+        shown_limit = max(1, min(int(limit), 50))
+        for classification, heading in groups:
+            group = [r for r in rows if r["classification"] == classification]
+            lines.append(heading + ":")
+            if not group:
+                lines.append("  none")
+                continue
+            for row in group[:shown_limit]:
+                lead = "?" if row["median_lead"] is None else f"{row['median_lead']:.1f}s"
+                pulse = "?" if row["median_pulse"] is None else f"{row['median_pulse']:.1f}s"
+                lines.append(
+                    f"  {row['key'].label}: class={classification}; direction={row['direction']}; "
+                    f"steps={row['target_steps']}; pre={row['pre_hits']} ({row['pre_rate']*100:.0f}%); "
+                    f"cycles={row['cycle_hits']} ({row['cycle_rate']*100:.0f}%); "
+                    f"near-step={row['near_hits']} ({row['near_rate']*100:.0f}%); "
+                    f"median_lead={lead}; median_pulse={pulse}; controls={row['control_rate']*100:.0f}%; "
+                    f"lift={row['lift']*100:+.0f}pp"
+                )
+                lines.append(f"    {row['explanation']}")
+
+        lines.append("Paired physical observations:")
+        if not manual:
+            lines.append("  none/insufficient")
+        else:
+            for row in manual[:shown_limit]:
+                lines.append(
+                    f"  {row['key'].label}: RED->OFF {row['direction']} in {row['support']}/{row['pair_count']} "
+                    f"pair(s), consistency={row['consistency']*100:.0f}%, post-pass return={row['return_rate']*100:.0f}%"
+                )
+        lines.append(
+            "No automated candidate is allowed to produce RED/OFF output until the CSV mapping is explicitly verified with provenance and polarity."
+        )
+        await send_text(interaction, "\n".join(lines), paged=True)
     except Exception as exc:
-        text = f"Error: {exc}"
-    await send_text(interaction, text, paged=True)
+        await send_text(interaction, f"Error: {exc}")
 
 
-@bot.tree.command(name="progress", description="Show compact learning progress summary.")
+@bot.tree.command(name="progress", description="Show protocol ingestion, snapshot and observation progress.")
 async def progress_cmd(interaction: discord.Interaction) -> None:
     await interaction.response.defer()
     try:
-        text = await run_cli_async(cli_args("progress"))
+        known = known_bits()
+        verified = sum(1 for row in known.rows if row.trusted_for_live_aspect)
+        reference_only = sum(1 for row in known.rows if row.described and not row.trusted_for_live_aspect)
+        lines = ["T3 protocol-level progress"]
+        if not CFG.db_path.exists():
+            lines.append("Database does not exist yet.")
+            await send_text(interaction, "\n".join(lines))
+            return
+        with db_connect(readonly=True) as conn:
+            snapshot = feed_snapshot_status(conn)
+            lines.append(
+                f"S-Class snapshot: {'VALID' if snapshot['valid'] else 'NOT LIVE'}; "
+                f"generation={snapshot.get('generation', 0)}; "
+                f"refresh_in_progress={snapshot.get('refresh_in_progress', False)}"
+            )
+            lines.append(
+                f"last complete refresh={fmt_ts(snapshot.get('last_refresh'))}; "
+                f"last S event={fmt_ts(snapshot.get('last_s_event'))}; "
+                f"reason={snapshot.get('reason') or '-'}"
+            )
+            counts = {}
+            for table in [
+                "raw_td_messages", "berth_steps", "s_bit_events",
+                "s_snapshot_differences", "signal_observation_sessions",
+                "signal_observations", "pass_log", "pass_bit_events",
+            ]:
+                if table_exists(conn, table):
+                    counts[table] = int(conn.execute(f"SELECT COUNT(*) AS c FROM {table}").fetchone()["c"])
+                else:
+                    counts[table] = 0
+            lines.append(
+                f"raw TD messages={counts['raw_td_messages']:,}; duplicates ignored={snapshot.get('duplicate_messages', 0):,}; "
+                f"invalid rejected={snapshot.get('invalid_messages', 0):,}"
+            )
+            lines.append(
+                f"canonical CA berth steps={counts['berth_steps']:,}; precisely timed SF bit edges={counts['s_bit_events']:,}; "
+                f"SG/SH observational differences={counts['s_snapshot_differences']:,}"
+            )
+            lines.append(
+                f"physical observation sessions={counts['signal_observation_sessions']:,}; snapshots={counts['signal_observations']:,}"
+            )
+            lines.append(
+                f"known CSV rows={len(known.rows):,}; verified live-aspect mappings={verified}; reference-only mappings={reference_only}"
+            )
+            lines.append(
+                f"legacy pass-window rows retained for diagnostics={counts['pass_log']:,}; attached rows={counts['pass_bit_events']:,}. "
+                "They are no longer treated as proof of a physical aspect."
+            )
+            if table_exists(conn, "refresh_history"):
+                refreshes = conn.execute(
+                    """
+                    SELECT status,COUNT(*) AS c FROM refresh_history GROUP BY status ORDER BY status
+                    """
+                ).fetchall()
+                if refreshes:
+                    lines.append("refresh history: " + ", ".join(f"{r['status']}={r['c']}" for r in refreshes))
+        await send_text(interaction, "\n".join(lines), paged=True)
     except Exception as exc:
-        text = f"Error: {exc}"
-    await send_text(interaction, text, paged=True)
+        await send_text(interaction, f"Error: {exc}")
 
 
 @bot.tree.command(name="known", description="Show known_bits.csv mappings for a signal.")
@@ -1338,104 +1589,115 @@ async def check_cmd(interaction: discord.Interaction) -> None:
     await send_text(interaction, text, paged=True)
 
 
-@bot.tree.command(name="bit", description="Show current/latest state for a byte:bit, e.g. 25:3.")
+@bot.tree.command(name="bit", description="Show raw S-Class bit state, provenance and protocol classification.")
 async def bit_cmd(interaction: discord.Interaction, bit: str) -> None:
     await interaction.response.defer()
     try:
         key = learner_mod.parse_bit_spec(bit)
         known = known_bits()
-        desc = known.describe(key)
+        lines = [f"S-Class bit {key.label}"]
         current_value = None
         current_ts = None
         current_msg = None
         latest_change = None
+        snapshot: dict[str, Any] = {"valid": False, "reason": "database unavailable"}
 
         if CFG.db_path.exists():
             with db_connect(readonly=True) as conn:
-                current_value, current_ts, current_msg = current_bit_value(conn, key)
+                snapshot = feed_snapshot_status(conn)
+                if snapshot["valid"]:
+                    current_value, current_ts, current_msg = current_bit_value(conn, key)
                 if table_exists(conn, "s_bit_events"):
                     latest_change = conn.execute(
                         """
                         SELECT event_ts, old_bit, new_bit, msg_type, old_byte, new_byte
                         FROM s_bit_events
                         WHERE area=? AND address=? AND bit=?
-                        ORDER BY event_ts DESC
-                        LIMIT 1
+                          AND UPPER(COALESCE(msg_type,''))='SF'
+                        ORDER BY event_ts DESC LIMIT 1
                         """,
                         (CFG.nr_area, int(key.address, 16), int(key.bit)),
                     ).fetchone()
 
-        lines = []
-        if current_value is None:
-            lines.append(f"{key.label} has no current byte snapshot yet.")
+        if snapshot.get("valid"):
+            if current_value is None:
+                lines.append("Live snapshot is valid, but this byte has not been seen.")
+            else:
+                lines.append(
+                    f"Current raw value: {current_value} at {fmt_ts(current_ts)} via {current_msg or '?'} "
+                    f"(snapshot generation {snapshot.get('generation', 0)})"
+                )
         else:
-            state_text = describe_raw_bit_state(known, key, current_value)
-            lines.append(f"{key.label} = {state_text} at {fmt_ts(current_ts)} (src {current_msg or '?'})")
+            lines.append(
+                f"Current raw value withheld: S-Class snapshot is not live/valid. "
+                f"{snapshot.get('reason') or 'Waiting for complete SG...SH refresh.'}"
+            )
 
         if latest_change:
-            new = int(latest_change["new_bit"])
             old_byte = "??" if latest_change["old_byte"] is None else f"{int(latest_change['old_byte']):02X}"
             new_byte = f"{int(latest_change['new_byte']):02X}"
             lines.append(
-                f"Latest raw change: {latest_change['old_bit']}->{latest_change['new_bit']} "
-                f"byte {old_byte}->{new_byte} at {fmt_ts(float(latest_change['event_ts']))} "
-                f"via {latest_change['msg_type']}"
+                f"Latest precisely timed SF edge: {latest_change['old_bit']}->{latest_change['new_bit']} "
+                f"byte {old_byte}->{new_byte} at {fmt_ts(float(latest_change['event_ts']))}"
             )
+        else:
+            lines.append("No precisely timed SF edge stored for this bit.")
+
+        rows = known.by_key.get(key, [])
+        if rows:
+            lines.append("CSV/reference mapping(s):")
+            for row in rows:
+                live = "trusted for live aspect" if row.trusted_for_live_aspect else "reference only"
+                lines.append(f"  {row.summary()} | {live}")
+        else:
+            lines.append("CSV/reference mapping: none")
 
         mapped_signals = sorted(known.signals_for_key(key))
-        if mapped_signals:
-            lines.append(f"Known signal(s): {', '.join(mapped_signals)}")
-
-        # Give /bit the same operational context as /signal. A raw 0/1 alone is
-        # not enough, but if this bit is mapped to a signal and has pass-window
-        # evidence we can show the learned polarity, clearly marked as low
-        # evidence when it is below the normal live-state threshold.
-        if mapped_signals and current_value is not None and CFG.db_path.exists():
-            try:
-                with db_connect(readonly=True) as conn:
-                    evidence_lines: list[str] = []
-                    for sig in mapped_signals[:5]:
-                        pc = pass_count_for_signal(conn, sig)
-                        if pc <= 0:
-                            continue
-                        match = None
-                        for row in learned_candidate_rows(conn, sig, score_window=12.0, limit=80):
-                            ckey = learner_mod.BitKey(f"{int(row['address']):02X}", int(row["bit"]))
-                            if ckey == key:
-                                match = row
-                                break
-                        if match is None:
-                            continue
-                        best = candidate_best_for_display(match, pc)
-                        state = describe_candidate_current(current_value, best, allow_low_evidence=True)
-                        evidence_note = "high confidence" if best.get("confidence_ok") else "LOW evidence only"
-                        evidence_lines.append(
-                            f"  {sig}: {state}; {best['bucket']} {confidence_text(best, pc)}; "
-                            f"{best['polarity_text']} ({evidence_note})"
+        if mapped_signals and CFG.db_path.exists():
+            with db_connect(readonly=True) as conn:
+                for sig in mapped_signals[:5]:
+                    matches = [
+                        row for row in learner_mod.protocol_candidate_analysis(
+                            conn, sig, area=CFG.nr_area, max_steps=250
+                        ) if row["key"] == key
+                    ]
+                    if not matches:
+                        lines.append(f"Protocol evidence for {sig}: none/insufficient")
+                        continue
+                    row = matches[0]
+                    if row["classification"] == "movement_pulse":
+                        pulse = "?" if row["median_pulse"] is None else f"{row['median_pulse']:.1f}s"
+                        lines.append(
+                            f"Protocol evidence for {sig}: REJECTED as aspect candidate; movement/track-shaped "
+                            f"pulse in {row['near_hits']}/{row['target_steps']} steps, median {pulse}."
                         )
-                    if evidence_lines:
-                        lines.append("Learned interpretation for mapped signal(s):")
-                        lines.extend(evidence_lines)
-            except Exception as exc:
-                lines.append(f"Learned interpretation unavailable: {exc}")
+                    else:
+                        lead = "?" if row["median_lead"] is None else f"{row['median_lead']:.1f}s"
+                        lines.append(
+                            f"Protocol evidence for {sig}: {row['classification']}; {row['direction']} with "
+                            f"{row['cycle_hits']}/{row['target_steps']} complete cycles, median lead {lead}; "
+                            "this may be signal OR route and is not a physical aspect proof."
+                        )
 
-        lines.append(f"Known CSV: {desc}")
         await send_text(interaction, "\n".join(lines), paged=True)
     except Exception as exc:
         await send_text(interaction, f"Error: {exc}")
 
 
-@bot.tree.command(name="signal", description="Show signal state: berth occupancy, routes and known signal bits.")
+@bot.tree.command(name="signal", description="Show TD berth state and cautious protocol-level S-Class evidence.")
 async def signal_cmd(interaction: discord.Interaction, signal: str) -> None:
     await interaction.response.defer()
     try:
         sig = learner_mod.normalize_berth(signal)
         known = known_bits()
         keys = sorted(known.keys_for_signal(sig), key=lambda k: (int(k.address, 16), k.bit))
-        lines = [f"Signal {sig}"]
+        lines = [f"Signal/berth {sig}"]
 
         route_nexts = sorted(topology().get(sig, set()), key=lambda x: (not x.isdigit(), x))
-        lines.append("Routes/next berths: " + (", ".join(route_nexts) if route_nexts else "none configured"))
+        lines.append("Configured next berth(s): " + (", ".join(route_nexts) if route_nexts else "none"))
+        lines.append(
+            "Important: a C-Class CA is a berth step. It does not independently prove the exact physical signal-passage time."
+        )
 
         if not CFG.db_path.exists():
             lines.append("Database does not exist yet.")
@@ -1443,109 +1705,310 @@ async def signal_cmd(interaction: discord.Interaction, signal: str) -> None:
             return
 
         with db_connect(readonly=True) as conn:
+            snapshot = feed_snapshot_status(conn)
+            if snapshot["valid"]:
+                lines.append(
+                    f"S-Class snapshot: VALID generation {snapshot['generation']}; "
+                    f"last complete SG...SH refresh {fmt_ts(snapshot['last_refresh'])}; "
+                    f"last TD event/heartbeat {fmt_ts(snapshot['last_feed_event'])}"
+                )
+            else:
+                state = "refresh in progress" if snapshot.get("refresh_in_progress") else "not live"
+                lines.append(
+                    f"S-Class snapshot: {state.upper()}; {snapshot.get('reason') or 'waiting for a complete refresh'}. "
+                    "Persisted raw bytes are not used as current signal state."
+                )
+
             if table_exists(conn, "berth_state"):
                 berth = conn.execute("SELECT * FROM berth_state WHERE berth=?", (sig,)).fetchone()
             else:
                 berth = None
-
             if berth and int(berth["occupied"]):
-                lines.append(f"Train/headcode in berth: {berth['descr'] or 'unknown'} at {fmt_ts(float(berth['updated_ts']))} via {berth['source_msg_type'] or '?'}")
+                lines.append(
+                    f"TD berth: occupied by {berth['descr'] or 'unknown'}; "
+                    f"updated {fmt_ts(float(berth['updated_ts']))} via {berth['source_msg_type'] or '?'}"
+                )
             elif berth:
-                lines.append(f"Berth currently clear, last update {fmt_ts(float(berth['updated_ts']))} via {berth['source_msg_type'] or '?'}")
+                lines.append(
+                    f"TD berth: clear; last update {fmt_ts(float(berth['updated_ts']))} "
+                    f"via {berth['source_msg_type'] or '?'}"
+                )
             else:
-                lines.append("Berth occupancy: no stored state yet")
+                lines.append("TD berth: no stored state yet")
 
-            if route_nexts and table_exists(conn, "berth_state"):
-                occupied_nexts = []
-                for next_berth in route_nexts:
-                    r = conn.execute("SELECT * FROM berth_state WHERE berth=?", (next_berth,)).fetchone()
-                    if r and int(r["occupied"]):
-                        occupied_nexts.append(f"{next_berth}:{r['descr'] or 'unknown'}")
-                if occupied_nexts:
-                    lines.append("Train/headcode in next berth(s): " + ", ".join(occupied_nexts))
-
-            recent_moves = recent_moves_for_berth(conn, sig, limit=3)
-            if recent_moves:
-                lines.append("Recent C-Class pass/move history involving this berth:")
-                for mv in recent_moves:
-                    headcode = mv["descr"] or "----"
-                    status = "finalised" if mv["finalised_ts"] is not None else "pending"
+            # Canonical C-Class history.
+            if table_exists(conn, "berth_steps"):
+                steps = conn.execute(
+                    """
+                    SELECT event_ts,descr,from_berth,to_berth,source_msg_type
+                    FROM berth_steps
+                    WHERE from_berth=? OR to_berth=?
+                    ORDER BY event_ts DESC LIMIT 4
+                    """,
+                    (sig, sig),
+                ).fetchall()
+            else:
+                steps = []
+            if steps:
+                lines.append("Recent C-Class berth steps involving this berth:")
+                for row in steps:
                     lines.append(
-                        f"  {fmt_ts(float(mv['pass_ts']))} {headcode} "
-                        f"{mv['from_berth']} -> {mv['to_berth']} "
-                        f"(signal/pass {mv['signal']}, {status})"
+                        f"  {fmt_ts(float(row['event_ts']))} {row['descr'] or '----'} "
+                        f"{row['from_berth']} -> {row['to_berth']} ({row['source_msg_type'] or 'CA'})"
                     )
 
-            pass_count = pass_count_for_signal(conn, sig)
-            candidates = learned_candidate_rows(conn, sig, score_window=12.0, limit=25)
-            known_key_set = set(keys)
-            candidate_by_key: dict[learner_mod.BitKey, tuple[sqlite3.Row, dict[str, Any]]] = {}
-            for row in candidates:
-                ckey = learner_mod.BitKey(f"{int(row['address']):02X}", int(row["bit"]))
-                candidate_by_key[ckey] = (row, candidate_best_for_display(row, pass_count))
-
+            lines.append("Physical aspect:")
+            trusted_aspect_seen = False
             if not keys:
-                lines.append("CSV mapped signal bit: none in known_bits.csv")
+                lines.append("  UNKNOWN — no CSV/reference bit is mapped to this signal.")
             else:
-                lines.append("CSV mapped bit state:")
                 for key in keys:
-                    val, updated_ts, msg_type = current_bit_value(conn, key)
-                    best = candidate_by_key.get(key, (None, None))[1]
-                    lines.append(signal_bit_interpretation_line(conn, key, val, updated_ts, msg_type, best, pass_count))
-                    changes = recent_bit_change_count(conn, key, seconds=DERIVE_FLICKER_WINDOW_SECONDS)
-                    if changes >= DERIVE_FLICKER_WARN_CHANGES and not (best and best.get("confidence_ok")):
-                        lines.append(
-                            f"    Warning: {key.label} changed {changes} times in the last "
-                            f"{DERIVE_FLICKER_WINDOW_SECONDS/60:.0f}m; this is probably not a steady red-lamp state bit."
+                    rows = known.by_key.get(key, [])
+                    sources = sorted({(r.provenance or "reference-unverified") for r in rows})
+                    verified = trusted_live_mapping_rows(known, key, sig)
+                    raw_value: int | None = None
+                    raw_ts: float | None = None
+                    raw_src: str | None = None
+                    if snapshot["valid"]:
+                        raw_value, raw_ts, raw_src = current_bit_value(conn, key)
+                    if verified and raw_value is not None:
+                        interpretations = []
+                        for row in verified:
+                            interpreted = _active_state_text(row.active_state, raw_value)
+                            if interpreted:
+                                interpretations.append(interpreted)
+                        if interpretations:
+                            trusted_aspect_seen = True
+                            lines.append(
+                                f"  {key.label}: raw {raw_value} -> {', '.join(sorted(set(interpretations)))}; "
+                                f"verified source {', '.join(sorted({r.provenance for r in verified}))}; "
+                                f"updated {fmt_ts(raw_ts)} via {raw_src or '?'}"
+                            )
+                        else:
+                            lines.append(
+                                f"  {key.label}: raw {raw_value}; mapping is verified but Active State/polarity is missing, "
+                                "so RED/OFF is not inferred."
+                            )
+                    else:
+                        raw_text = (
+                            f"raw {raw_value} at {fmt_ts(raw_ts)} via {raw_src or '?'}; "
+                            if raw_value is not None else "raw live state unavailable; "
                         )
-                    corr_warning = correlation_warning_line(conn, key, sig)
-                    if corr_warning:
-                        lines.append(corr_warning)
-
-            if pass_count and candidates:
-                confident = []
-                low = []
-                for row in candidates:
-                    key = learner_mod.BitKey(f"{int(row['address']):02X}", int(row["bit"]))
-                    best = candidate_best_for_display(row, pass_count)
-                    if best["best_count"] <= 0:
-                        continue
-                    (confident if best["confidence_ok"] else low).append((row, key, best))
-
-                lines.append(f"Learned candidates from pass evidence ({pass_count} finalised passes):")
-                if confident:
-                    for row, key, best in confident[:5]:
-                        val, updated_ts, msg_type = current_bit_value(conn, key)
-                        current_text = describe_candidate_current(val, best)
-                        marker = "CSV" if key in known_key_set else "learned"
                         lines.append(
-                            f"  {key.label}: {marker}; {best['bucket']} "
-                            f"{confidence_text(best, pass_count)}; "
-                            f"{best['guess']}; {best['polarity_text']}; {current_text}"
+                            f"  {key.label}: {raw_text}reference source={','.join(sources)}; "
+                            "NOT verified for live aspect use."
                         )
-                else:
+                if not trusted_aspect_seen:
                     lines.append(
-                        f"  No high-confidence live-state candidates yet "
-                        f"(need >= {DERIVE_MIN_SUPPORT} hits, >= {DERIVE_MIN_PCT*100:.0f}%, avg_delta <= {DERIVE_MAX_AVG_DELTA:.1f}s)."
+                        "  Result: UNKNOWN. Existing CSV rows are references only until verified by SOP/ECS or repeated paired physical observations."
                     )
-                    for row, key, best in low[:3]:
-                        marker = "CSV" if key in known_key_set else "learned"
-                        lines.append(
-                            f"  low-evidence {key.label}: {marker}; {best['bucket']} "
-                            f"{confidence_text(best, pass_count)}; not used for live state"
-                        )
 
-                if keys and confident and all(item[1] not in known_key_set for item in confident[:3]):
-                    lines.append("Warning: the CSV mapped bit is not one of the top high-confidence learned candidates for this signal. Treat the CSV aspect as suspect until checked on the panel.")
-            elif not pass_count:
-                lines.append("Learned candidates: no finalised CA pass evidence yet.")
+            protocol_rows = learner_mod.protocol_candidate_analysis(
+                conn, sig, area=CFG.nr_area, max_steps=250
+            )
+            rejected = [r for r in protocol_rows if r["classification"] == "movement_pulse"]
+            controls = [r for r in protocol_rows if r["classification"] == "pre_step_control"]
+            correlated = [r for r in protocol_rows if r["classification"] == "correlated_control"]
+
+            if rejected:
+                lines.append("Rejected movement/track-shaped mappings:")
+                for row in rejected[:5]:
+                    pulse = "?" if row["median_pulse"] is None else f"{row['median_pulse']:.1f}s"
+                    lines.append(
+                        f"  {row['key'].label}: near step {row['near_hits']}/{row['target_steps']} "
+                        f"({row['near_rate']*100:.0f}%); median pulse {pulse}; {row['explanation']}"
+                    )
+
+            if controls:
+                lines.append("Pre-step S-Class control candidates (not proof of physical aspect):")
+                for row in controls[:5]:
+                    lead = "?" if row["median_lead"] is None else f"{row['median_lead']:.1f}s"
+                    lines.append(
+                        f"  {row['key'].label}: {row['direction']} before "
+                        f"{row['cycle_hits']}/{row['target_steps']} step(s); median lead {lead}; "
+                        f"target {row['pre_rate']*100:.0f}% vs unrelated controls {row['control_rate']*100:.0f}% "
+                        f"(lift {row['lift']*100:+.0f}pp). Signal OR route candidate only."
+                    )
+            elif correlated:
+                lines.append("Only weak/general movement correlations found; none are safe as signal-aspect candidates.")
+            elif not protocol_rows:
+                lines.append("Protocol learner: not enough canonical berth-step/SF edge evidence yet.")
+
+            if table_exists(conn, "signal_observation_sessions"):
+                manual = learner_mod.manual_observation_candidates(conn, sig)
+            else:
+                manual = []
+            if manual:
+                lines.append("Paired physical RED/OFF observations:")
+                for row in manual[:5]:
+                    lines.append(
+                        f"  {row['key'].label}: RED->OFF {row['direction']} in "
+                        f"{row['support']}/{row['pair_count']} pair(s) "
+                        f"({row['consistency']*100:.0f}%); returned after pass in {row['return_rate']*100:.0f}% of supported sessions."
+                    )
+                lines.append(
+                    "Observation candidates remain non-authoritative until enough clean sessions are reviewed and the CSV is explicitly marked verified."
+                )
+            else:
+                lines.append(
+                    "Physical observations: none/insufficient. Use /observe_signal with red, off and post_pass during the same approach."
+                )
 
         await send_text(interaction, "\n".join(lines), paged=True)
     except Exception as exc:
         await send_text(interaction, f"Error: {exc}")
 
 
-@bot.tree.command(name="recent_bits", description="Show most recent raw S-Class bit changes.")
+@bot.tree.command(name="observe_signal", description="Capture a paired physical signal observation against the live S-Class snapshot.")
+@app_commands.describe(
+    signal="Signal/berth, e.g. 6239",
+    state="Use red, off, post_pass or cancel",
+    headcode="Optional train/headcode for this approach",
+    notes="Optional short observation note",
+)
+@app_commands.choices(state=[
+    app_commands.Choice(name="RED / on", value="red"),
+    app_commands.Choice(name="OFF / proceed", value="off"),
+    app_commands.Choice(name="Post-pass / restored", value="post_pass"),
+    app_commands.Choice(name="Cancel current session", value="cancel"),
+])
+async def observe_signal_cmd(
+    interaction: discord.Interaction,
+    signal: str,
+    state: app_commands.Choice[str],
+    headcode: Optional[str] = None,
+    notes: Optional[str] = None,
+) -> None:
+    await interaction.response.defer()
+    sig = learner_mod.normalize_berth(signal)
+    chosen = state.value
+    try:
+        store = learner_mod.Store(CFG.db_path, CFG.missing_dir)
+        try:
+            if chosen == "cancel":
+                session = store.latest_open_observation_session(sig)
+                if session is None:
+                    await send_text(interaction, f"No open observation session for {sig}.")
+                    return
+                store.cancel_observation_session(int(session["id"]), notes or "cancelled by Discord command")
+                await send_text(interaction, f"Cancelled observation session {int(session['id'])} for {sig}.")
+                return
+
+            valid, generation, snapshot, last_refresh, reason = store.current_snapshot(CFG.nr_area)
+            snapshot_status = feed_snapshot_status(store.conn)
+            valid = bool(valid and snapshot_status.get("valid"))
+            if not valid:
+                await send_text(
+                    interaction,
+                    f"Cannot capture {chosen}: the S-Class snapshot is not live/valid. "
+                    f"{snapshot_status.get('reason') or reason or 'Wait for a complete SG...SH refresh.'}",
+                )
+                return
+            if not snapshot:
+                await send_text(interaction, "Cannot capture observation: live snapshot contains no bytes.")
+                return
+
+            if chosen == "red":
+                session_id = store.start_observation_session(
+                    sig, descr=(headcode or "").strip(), notes=(notes or "").strip()
+                )
+            else:
+                session = store.latest_open_observation_session(sig)
+                if session is None:
+                    await send_text(
+                        interaction,
+                        f"No open {sig} observation session. Capture RED first, then OFF, then post_pass.",
+                    )
+                    return
+                session_id = int(session["id"])
+                existing = store.conn.execute(
+                    "SELECT state FROM signal_observations WHERE session_id=?",
+                    (session_id,),
+                ).fetchall()
+                existing_states = {str(r["state"]).lower() for r in existing}
+                if chosen == "off" and "red" not in existing_states:
+                    await send_text(interaction, "This session has no RED snapshot. Start again with state RED.")
+                    return
+                if chosen == "post_pass" and not {"red", "off"}.issubset(existing_states):
+                    await send_text(interaction, "Capture both RED and OFF before the post-pass snapshot.")
+                    return
+
+            observation_id = store.add_signal_observation(
+                session_id=session_id,
+                signal_id=sig,
+                state=chosen,
+                snapshot=snapshot,
+                generation=generation,
+                notes=(notes or "").strip(),
+            )
+            next_action = {
+                "red": "Capture OFF as soon as you physically see the signal clear.",
+                "off": "Capture post_pass after the train has passed and the signal/route has restored.",
+                "post_pass": "Session complete. Repeating this on several separate approaches builds usable evidence.",
+            }[chosen]
+            await send_text(
+                interaction,
+                f"Captured {chosen.upper()} for signal {sig} in session {session_id} "
+                f"(observation {observation_id}, snapshot generation {generation}, "
+                f"last refresh {fmt_ts(last_refresh)}).\n{next_action}",
+            )
+        finally:
+            store.close()
+    except Exception as exc:
+        await send_text(interaction, f"Error: {exc}")
+
+
+@bot.tree.command(name="observations", description="Show paired RED/OFF physical observation evidence for a signal.")
+async def observations_cmd(interaction: discord.Interaction, signal: str) -> None:
+    await interaction.response.defer()
+    sig = learner_mod.normalize_berth(signal)
+    try:
+        with db_connect(readonly=True) as conn:
+            if not table_exists(conn, "signal_observation_sessions"):
+                await send_text(interaction, "No observation tables exist yet. Restart the updated bot once to migrate the database.")
+                return
+            sessions = conn.execute(
+                """
+                SELECT s.*,
+                       SUM(CASE WHEN o.state='red' THEN 1 ELSE 0 END) AS red_count,
+                       SUM(CASE WHEN o.state='off' THEN 1 ELSE 0 END) AS off_count,
+                       SUM(CASE WHEN o.state='post_pass' THEN 1 ELSE 0 END) AS post_count
+                FROM signal_observation_sessions s
+                LEFT JOIN signal_observations o ON o.session_id=s.id
+                WHERE s.signal=?
+                GROUP BY s.id
+                ORDER BY s.started_ts DESC LIMIT 20
+                """,
+                (sig,),
+            ).fetchall()
+            candidates = learner_mod.manual_observation_candidates(conn, sig)
+
+        lines = [f"Physical observation evidence for {sig}"]
+        if not sessions:
+            lines.append("No sessions yet. Use /observe_signal state:red during an approach.")
+        else:
+            lines.append(f"Sessions: {len(sessions)} shown")
+            for row in sessions[:8]:
+                lines.append(
+                    f"  #{row['id']} {row['status']} started {fmt_ts(float(row['started_ts']))}; "
+                    f"RED={int(row['red_count'] or 0)} OFF={int(row['off_count'] or 0)} "
+                    f"POST={int(row['post_count'] or 0)} headcode={row['descr'] or '-'}"
+                )
+        if candidates:
+            lines.append("Consistent RED->OFF candidates:")
+            for row in candidates[:10]:
+                lines.append(
+                    f"  {row['key'].label}: {row['direction']} in {row['support']}/{row['pair_count']} pair(s) "
+                    f"({row['consistency']*100:.0f}%); post-pass return {row['return_rate']*100:.0f}%"
+                )
+        else:
+            lines.append("No bit has at least two consistent paired RED/OFF observations yet.")
+        await send_text(interaction, "\n".join(lines), paged=True)
+    except Exception as exc:
+        await send_text(interaction, f"Error: {exc}")
+
+
+@bot.tree.command(name="recent_bits", description="Show recent precisely timed SF bit changes.")
 @app_commands.describe(
     signal="Optional signal to filter by known_bits.csv mapping, e.g. 6244",
     bit="Optional byte:bit filter, e.g. 25:3",
@@ -1569,8 +2032,8 @@ async def recent_bits_cmd(
 
         known = known_bits()
         params: list[Any] = [CFG.nr_area]
-        where = ["area=?"]
-        title_parts = ["Recent S-Class bit changes"]
+        where = ["area=?", "UPPER(COALESCE(msg_type,''))='SF'"]
+        title_parts = ["Recent precisely timed SF bit changes"]
 
         if bit:
             key = learner_mod.parse_bit_spec(bit)
@@ -1643,11 +2106,11 @@ async def recent_bits_cmd(
 
 
 
-@bot.tree.command(name="bit_correlate", description="Find which signals/berths a raw S-Class bit best correlates with.")
+@bot.tree.command(name="bit_correlate", description="Exploratory SF-edge correlation with canonical CA berth steps.")
 @app_commands.describe(
     bit="Byte:bit filter, e.g. 25:3",
     since_minutes="Only analyse bit changes newer than this many minutes",
-    match_window_seconds="Seconds either side used to link bit changes to CA/pass movements",
+    match_window_seconds="Seconds either side used to compare an SF edge with canonical CA berth steps",
     limit="Maximum candidate signal/berth rows to show",
 )
 async def bit_correlate_cmd(
@@ -1684,7 +2147,7 @@ async def bit_correlate_cmd(
             f"Raw changes in window: {total_changes}",
         ]
         if not rows:
-            lines.append("No nearby C-Class/pass_log movements found for this bit in that window.")
+            lines.append("No nearby canonical C-Class berth steps found for this bit in that window.")
         else:
             lines.append(
                 "Columns: matched_changes/raw_changes, matched_moves, all recent moves involving candidate, avg_delta, timing, edge, routes"
@@ -1704,7 +2167,7 @@ async def bit_correlate_cmd(
                     f"{row['timing']}, {row['edge']}; routes: {routes}"
                 )
             lines.append(
-                "Note: shared bits can correlate with several adjacent berths. A good signal-specific bit should have high matched_changes, low avg_abs_delta, and few extra changes outside that candidate's movements."
+                "Note: shared bits can correlate with several adjacent berths. This is correlation only, not aspect proof. A specific control should have high matched changes, low timing spread, and few unrelated changes."
             )
 
         await send_text(interaction, "\n".join(lines), paged=True)
@@ -1712,12 +2175,12 @@ async def bit_correlate_cmd(
         await send_text(interaction, f"Error: {exc}")
 
 
-@bot.tree.command(name="bit_trace", description="Compare raw bit changes with nearby C-Class moves for a signal.")
+@bot.tree.command(name="bit_trace", description="Compare precisely timed SF edges with canonical CA berth steps.")
 @app_commands.describe(
     bit="Byte:bit filter, e.g. 25:3",
     signal="Signal/berth to compare against, e.g. 6244. Defaults to known_bits.csv mapping if unique.",
     since_minutes="Only show changes newer than this many minutes",
-    match_window_seconds="Seconds either side used to link the bit change to that signal's CA move",
+    match_window_seconds="Seconds either side used to compare the SF edge with that berth's CA step",
     limit="Maximum raw bit changes to show",
 )
 async def bit_trace_cmd(
@@ -1757,6 +2220,7 @@ async def bit_trace_cmd(
                 SELECT event_ts, old_bit, new_bit, old_byte, new_byte, msg_type
                 FROM s_bit_events
                 WHERE area=? AND address=? AND bit=? AND event_ts >= ?
+                  AND UPPER(COALESCE(msg_type,''))='SF'
                 ORDER BY event_ts DESC
                 LIMIT ?
                 """,
@@ -1773,7 +2237,7 @@ async def bit_trace_cmd(
             lines = [
                 f"Bit trace {key.label} vs signal {sig} | last {since_minutes}m | match window +/-{match_window:.0f}s",
                 f"Known CSV: {known.describe(key)}",
-                f"Summary: {total_changes} raw change(s), {matched_count} near {sig} CA move(s), {move_count} movement(s) involving {sig}.",
+                f"Summary: {total_changes} SF edge(s), {matched_count} near a {sig} CA berth step, {move_count} canonical movement(s) involving {sig}.",
             ]
             warn = correlation_warning_line(conn, key, sig, seconds=seconds, match_window_seconds=match_window)
             if warn:
@@ -1792,7 +2256,7 @@ async def bit_trace_cmd(
                         f"{nearest['descr'] or '----'} delta={delta:+.0f}s"
                     )
                 else:
-                    context = "NO MATCH to this signal"
+                    context = "NO MATCH to this berth's CA steps"
                 lines.append(
                     f"{fmt_ts(float(row['event_ts']))} {row['msg_type'] or '?'} "
                     f"{key.label} {row['old_bit']}->{row['new_bit']} byte {old_byte}->{new_byte} | {context}"
@@ -1803,20 +2267,18 @@ async def bit_trace_cmd(
         await send_text(interaction, f"Error: {exc}")
 
 
-@bot.tree.command(name="route_bits", description="Find likely route bits from pass evidence.")
+@bot.tree.command(name="route_bits", description="Show route-specific pre-step controls without calling them signal aspects.")
 @app_commands.describe(
-    signal="Signal/from berth to analyse, e.g. 6248",
-    to="Optional route/to berth, e.g. 6244",
-    phase="before, after, or both",
-    min_hits="Minimum matching bit hits",
-    limit="Maximum candidates to show",
+    signal="From berth/signal, e.g. 6248",
+    to="Optional exact next berth/route, e.g. 6244",
+    max_steps="Maximum recent canonical berth steps to analyse",
+    limit="Maximum rows to show",
 )
 async def route_bits_cmd(
     interaction: discord.Interaction,
     signal: str,
     to: Optional[str] = None,
-    phase: str = "before",
-    min_hits: int = 2,
+    max_steps: int = 250,
     limit: int = 20,
 ) -> None:
     await interaction.response.defer()
@@ -1826,87 +2288,40 @@ async def route_bits_cmd(
             return
         sig = learner_mod.normalize_berth(signal)
         to_norm = learner_mod.normalize_berth(to) if to else None
-        phase_norm = (phase or "before").strip().lower()
-        if phase_norm not in {"before", "after", "both"}:
-            phase_norm = "before"
-        min_hits = max(1, int(min_hits))
-        row_limit = clamp_limit(limit)
-        known = known_bits()
-
         with db_connect(readonly=True) as conn:
-            if not table_exists(conn, "pass_bit_events") or not table_exists(conn, "pass_log"):
-                await send_text(interaction, "pass_log/pass_bit_events tables do not exist yet.")
-                return
-
-            pass_where = ["signal=?"]
-            pass_params: list[Any] = [sig]
-            if to_norm:
-                pass_where.append("to_berth=?")
-                pass_params.append(to_norm)
-            route_pass_count = conn.execute(
-                f"SELECT COUNT(*) AS c FROM pass_log WHERE {' AND '.join(pass_where)}",
-                pass_params,
-            ).fetchone()["c"]
-
-            where = ["e.signal=?"]
-            params: list[Any] = [sig]
-            if to_norm:
-                where.append("p.to_berth=?")
-                params.append(to_norm)
-            if phase_norm != "both":
-                where.append("e.phase=?")
-                params.append(phase_norm)
-            params.extend([min_hits, row_limit])
-
-            rows = conn.execute(
-                f"""
-                SELECT
-                    p.to_berth AS to_berth,
-                    e.address AS address,
-                    e.bit AS bit,
-                    e.new_bit AS new_bit,
-                    e.phase AS phase,
-                    COUNT(*) AS hits,
-                    COUNT(DISTINCT e.pass_id) AS pass_hits,
-                    AVG(e.delta_seconds) AS avg_delta,
-                    MIN(e.delta_seconds) AS min_delta,
-                    MAX(e.delta_seconds) AS max_delta
-                FROM pass_bit_events e
-                JOIN pass_log p ON p.id=e.pass_id
-                WHERE {' AND '.join(where)}
-                GROUP BY p.to_berth, e.address, e.bit, e.new_bit, e.phase
-                HAVING hits>=?
-                ORDER BY pass_hits DESC, hits DESC, ABS(avg_delta) ASC
-                LIMIT ?
-                """,
-                params,
-            ).fetchall()
-
-            totals_by_route = {
-                str(r["to_berth"]): int(r["c"])
-                for r in conn.execute(
-                    "SELECT to_berth, COUNT(*) AS c FROM pass_log WHERE signal=? GROUP BY to_berth",
-                    (sig,),
-                ).fetchall()
-            }
-
-        lines = [f"Route bit candidates for signal {sig}" + (f" -> {to_norm}" if to_norm else "")]
-        lines.append(f"Phase: {phase_norm} | pass windows: {route_pass_count if to_norm else sum(totals_by_route.values())}")
-        if not rows:
-            lines.append("No matching route-bit candidates found. Let the learner collect more pass windows or lower min_hits.")
-        for row in rows:
-            route = str(row["to_berth"] or "?")
-            route_total = totals_by_route.get(route, 0)
-            pass_hits = int(row["pass_hits"] or 0)
-            confidence = (pass_hits / route_total) if route_total else 0.0
-            key = learner_mod.BitKey(f"{int(row['address']):02X}", int(row["bit"]))
-            desc = known.describe(key)
-            desc_text = "" if desc == "UNKNOWN" else f" | {desc}"
-            lines.append(
-                f"{route}: {key.label}={int(row['new_bit'])} [{row['phase']}] "
-                f"hits={int(row['hits'])} passes={pass_hits}/{route_total} conf={confidence:.2f} "
-                f"avg_delta={float(row['avg_delta']):+.1f}s range={float(row['min_delta']):+.1f}..{float(row['max_delta']):+.1f}s{desc_text}"
+            rows = learner_mod.protocol_candidate_analysis(
+                conn,
+                sig,
+                area=CFG.nr_area,
+                max_steps=max(10, min(int(max_steps), 1000)),
+                to_berth=to_norm,
             )
+        heading = f"Route-specific S-Class controls for {sig}" + (f" -> {to_norm}" if to_norm else "")
+        lines = [heading]
+        lines.append(
+            "Only precisely timed SF edges are used. A pre-step cycle can be a route indication or a signal indication; this command does not promote it to a physical aspect."
+        )
+        controls = [r for r in rows if r["classification"] == "pre_step_control"]
+        pulses = [r for r in rows if r["classification"] == "movement_pulse"]
+        if controls:
+            lines.append("Pre-step control cycles:")
+            for row in controls[:max(1, min(int(limit), 50))]:
+                lead = "?" if row["median_lead"] is None else f"{row['median_lead']:.1f}s"
+                duration = "?" if row["median_cycle"] is None else f"{row['median_cycle']:.1f}s"
+                lines.append(
+                    f"  {row['key'].label}: {row['direction']}; cycles {row['cycle_hits']}/{row['target_steps']} "
+                    f"({row['cycle_rate']*100:.0f}%); median lead {lead}; median full cycle {duration}; "
+                    f"unrelated-control rate {row['control_rate']*100:.0f}% (lift {row['lift']*100:+.0f}pp)"
+                )
+        else:
+            lines.append("No sufficiently specific pre-step control cycle found.")
+        if pulses:
+            lines.append("Rejected track/step/release-shaped pulses:")
+            for row in pulses[:5]:
+                pulse = "?" if row["median_pulse"] is None else f"{row['median_pulse']:.1f}s"
+                lines.append(
+                    f"  {row['key'].label}: near step {row['near_hits']}/{row['target_steps']}; median pulse {pulse}"
+                )
         await send_text(interaction, "\n".join(lines), paged=True)
     except Exception as exc:
         await send_text(interaction, f"Error: {exc}")
@@ -1925,8 +2340,11 @@ async def db_stats_cmd(interaction: discord.Interaction) -> None:
             freelist_count = conn.execute("PRAGMA freelist_count").fetchone()[0]
             rows: list[str] = []
             for table in [
-                "s_bytes", "s_bit_events", "berth_state", "pass_log", "pass_bit_events",
-                "missing_topology_moves", "missing_topology_summary",
+                "feed_state", "raw_td_messages", "refresh_history", "s_bytes",
+                "s_bit_events", "s_snapshot_differences", "berth_state", "berth_steps",
+                "signal_observation_sessions", "signal_observations",
+                "pass_log", "pass_bit_events", "missing_topology_moves",
+                "missing_topology_summary",
             ]:
                 if table_exists(conn, table):
                     count = conn.execute(f"SELECT COUNT(*) AS c FROM {table}").fetchone()["c"]
@@ -1964,7 +2382,10 @@ def optimise_database(*, purge_days: Optional[int], vacuum: bool) -> str:
         if purge_days is not None and purge_days > 0:
             cutoff = time.time() - (int(purge_days) * 86400)
             purge_specs = [
+                ("raw_td_messages", "event_ts"),
                 ("s_bit_events", "event_ts"),
+                ("s_snapshot_differences", "observed_ts"),
+                ("berth_steps", "event_ts"),
                 ("pass_bit_events", "event_ts"),
                 ("pass_log", "pass_ts"),
                 ("missing_topology_moves", "event_ts"),
@@ -2059,9 +2480,14 @@ async def download_cmd(interaction: discord.Interaction) -> None:
 
 
 def backup_file(path: Path) -> None:
-    if path.exists():
-        CFG.backups_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(path, CFG.backups_dir / f"{path.name}.{stamp()}.bak")
+    if not path.exists():
+        return
+    CFG.backups_dir.mkdir(parents=True, exist_ok=True)
+    destination = CFG.backups_dir / f"{path.name}.{stamp()}.bak"
+    if path.suffix.lower() in {".sqlite", ".db"}:
+        sqlite_backup_to(path, destination)
+    else:
+        shutil.copy2(path, destination)
 
 
 def vacuum_sqlite_into_single_file(src: Path, dest: Path) -> None:
