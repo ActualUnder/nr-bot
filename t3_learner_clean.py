@@ -677,7 +677,8 @@ class Store:
                     descr TEXT,
                     occupied INTEGER NOT NULL DEFAULT 0,
                     updated_ts REAL NOT NULL,
-                    source_msg_type TEXT
+                    source_msg_type TEXT,
+                    connection_generation INTEGER NOT NULL DEFAULT 0
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_berth_state_updated ON berth_state(updated_ts);
@@ -770,6 +771,7 @@ class Store:
                     area TEXT PRIMARY KEY,
                     snapshot_valid INTEGER NOT NULL DEFAULT 0,
                     snapshot_generation INTEGER NOT NULL DEFAULT 0,
+                    connection_generation INTEGER NOT NULL DEFAULT 0,
                     refresh_in_progress INTEGER NOT NULL DEFAULT 0,
                     refresh_started_ts REAL,
                     last_complete_refresh_ts REAL,
@@ -860,6 +862,29 @@ class Store:
                 CREATE INDEX IF NOT EXISTS idx_observation_signal ON signal_observations(signal, observed_ts);
                 CREATE INDEX IF NOT EXISTS idx_missing_last ON missing_topology_summary(last_ts);
             """)
+
+            # CREATE TABLE IF NOT EXISTS does not add columns to an existing
+            # database.  Keep the migration additive so old learner data is
+            # retained while the T3 API gains reconnect-safe C-Class state.
+            berth_columns = {
+                str(row["name"])
+                for row in self.conn.execute("PRAGMA table_info(berth_state)")
+            }
+            if "connection_generation" not in berth_columns:
+                self.conn.execute(
+                    "ALTER TABLE berth_state "
+                    "ADD COLUMN connection_generation INTEGER NOT NULL DEFAULT 0"
+                )
+
+            feed_columns = {
+                str(row["name"])
+                for row in self.conn.execute("PRAGMA table_info(feed_state)")
+            }
+            if "connection_generation" not in feed_columns:
+                self.conn.execute(
+                    "ALTER TABLE feed_state "
+                    "ADD COLUMN connection_generation INTEGER NOT NULL DEFAULT 0"
+                )
 
             # Backfill the canonical berth-step table from legacy pass_log data.
             # The old table is retained so existing reports/downloaded DBs continue
@@ -966,24 +991,33 @@ class Store:
                 (area.upper(), str(reason)[:500]),
             )
 
-    def mark_connected(self, area: str, ts: Optional[float] = None) -> None:
+    def mark_connected(self, area: str, ts: Optional[float] = None) -> int:
         if getattr(self, "read_only", False):
-            return
+            return 0
         now = float(ts if ts is not None else time.time())
         with self.lock, self.conn:
+            row = self.conn.execute(
+                "SELECT connection_generation FROM feed_state WHERE area=?",
+                (area.upper(),),
+            ).fetchone()
+            generation = int(row["connection_generation"] or 0) + 1 if row else 1
             self.conn.execute(
                 """
-                INSERT INTO feed_state(area,snapshot_valid,last_connected_ts,last_reason)
-                VALUES(?,0,?,'connected; waiting for complete SG...SH refresh')
+                INSERT INTO feed_state(
+                    area,snapshot_valid,connection_generation,last_connected_ts,last_reason
+                )
+                VALUES(?,0,?,?,'connected; waiting for complete SG...SH refresh')
                 ON CONFLICT(area) DO UPDATE SET
                     snapshot_valid=0,
+                    connection_generation=excluded.connection_generation,
                     refresh_in_progress=0,
                     refresh_started_ts=NULL,
                     last_connected_ts=excluded.last_connected_ts,
                     last_reason=excluded.last_reason
                 """,
-                (area.upper(), now),
+                (area.upper(), generation, now),
             )
+        return generation
 
     def mark_disconnected(self, area: str, reason: str = "feed disconnected") -> None:
         if getattr(self, "read_only", False):
@@ -1295,7 +1329,15 @@ class Store:
                 ("cancelled", time.time(), reason, int(session_id)),
             )
 
-    def record_berth_state(self, berth: str, descr: str, occupied: bool, ts: float, msg_type: str) -> None:
+    def record_berth_state(
+        self,
+        berth: str,
+        descr: str,
+        occupied: bool,
+        ts: float,
+        msg_type: str,
+        connection_generation: int = 0,
+    ) -> None:
         """Store a simple latest berth/headcode occupancy state for Discord /signal.
 
         The ON CONFLICT guard prevents a late older C-Class message from making
@@ -1306,13 +1348,17 @@ class Store:
             return
         with self.lock, self.conn:
             self.conn.execute("""
-                INSERT INTO berth_state(berth, descr, occupied, updated_ts, source_msg_type)
-                VALUES(?,?,?,?,?)
+                INSERT INTO berth_state(
+                    berth, descr, occupied, updated_ts, source_msg_type,
+                    connection_generation
+                )
+                VALUES(?,?,?,?,?,?)
                 ON CONFLICT(berth) DO UPDATE SET
                     descr=excluded.descr,
                     occupied=excluded.occupied,
                     updated_ts=excluded.updated_ts,
-                    source_msg_type=excluded.source_msg_type
+                    source_msg_type=excluded.source_msg_type,
+                    connection_generation=excluded.connection_generation
                 WHERE excluded.updated_ts >= berth_state.updated_ts
             """, (
                 normalize_berth(berth),
@@ -1320,6 +1366,7 @@ class Store:
                 1 if occupied else 0,
                 float(ts),
                 str(msg_type or ""),
+                max(0, int(connection_generation)),
             ))
 
     def record_raw_bit_event(self, event: BitEvent) -> None:
@@ -1843,6 +1890,11 @@ class Learner:
         self.trusted_addresses: Set[int] = set()
         state = self.store.feed_state_row(self.area)
         self.snapshot_generation = int(state["snapshot_generation"] or 0) if state else 0
+        self.connection_generation = (
+            int(state["connection_generation"] or 0)
+            if state and "connection_generation" in state.keys()
+            else 0
+        )
         self.snapshot_valid = False
 
         self.refresh_active = False
@@ -1889,7 +1941,7 @@ class Learner:
             self.snapshot_valid = False
             self.trusted_addresses.clear()
             self._reset_refresh_state()
-        self.store.mark_connected(self.area)
+        self.connection_generation = self.store.mark_connected(self.area)
 
     def mark_feed_gap(self, reason: str = "feed disconnected") -> None:
         with self.lock:
@@ -2168,7 +2220,14 @@ class Learner:
                         print(f"[C-SKIP-STALE] {fmt_ts(ts)} {msg_type} {berth} newer={fmt_ts(self.berth_ts.get(berth))}")
                     return
                 self._mark_berth_ts(ts, berth)
-                self.store.record_berth_state(berth, "", False, ts, msg_type)
+                self.store.record_berth_state(
+                    berth,
+                    "",
+                    False,
+                    ts,
+                    msg_type,
+                    self.connection_generation,
+                )
                 self._check_missing_topology(ts, descr, berth, berth, msg)
             return
 
@@ -2181,7 +2240,14 @@ class Learner:
                         print(f"[C-SKIP-STALE] {fmt_ts(ts)} {msg_type} {berth} newer={fmt_ts(self.berth_ts.get(berth))}")
                     return
                 self._mark_berth_ts(ts, berth)
-                self.store.record_berth_state(berth, descr, bool(descr), ts, msg_type)
+                self.store.record_berth_state(
+                    berth,
+                    descr,
+                    bool(descr),
+                    ts,
+                    msg_type,
+                    self.connection_generation,
+                )
                 self._check_missing_topology(ts, descr, berth, berth, msg)
             return
 
@@ -2205,8 +2271,22 @@ class Learner:
 
         # CA means the description moved from one berth to another.
         self._mark_berth_ts(ts, from_berth, to_berth)
-        self.store.record_berth_state(from_berth, "", False, ts, msg_type)
-        self.store.record_berth_state(to_berth, descr, True, ts, msg_type)
+        self.store.record_berth_state(
+            from_berth,
+            "",
+            False,
+            ts,
+            msg_type,
+            self.connection_generation,
+        )
+        self.store.record_berth_state(
+            to_berth,
+            descr,
+            True,
+            ts,
+            msg_type,
+            self.connection_generation,
+        )
 
         self._check_missing_topology(ts, descr, from_berth, to_berth, msg)
 
