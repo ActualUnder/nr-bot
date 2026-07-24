@@ -1,5 +1,19 @@
 # Metro T3 Network Rail Protocol Bot
 
+## Private T3 snapshot bridge
+
+This release adds one optional, read-only endpoint for the separate Metro bot:
+
+```text
+GET /v1/t3/snapshot
+```
+
+It binds only to a configured private address, uses HTTPS with mandatory client
+certificates, authorises the `metro-bot` certificate identity, and exposes T3
+berth snapshots only. C-Class berth rows are stamped with a connection
+generation so occupations left behind by a feed outage are withheld after
+reconnect. See [T3_BRIDGE_SETUP.md](T3_BRIDGE_SETUP.md).
+
 ## July 2026 command and timezone hotfix
 
 - Fixed the live `NameError: UK_TIMEZONE is not defined` raised when a C-Class berth step was formatted by the learner.
@@ -182,12 +196,15 @@ Minimum:
 
 ```env
 DISCORD_TOKEN=your_discord_bot_token
-METRO_BOT_DATA_DIR=/var/lib/metro-bot
+NRBOT_DATA_DIR=/var/lib/nr-bot
 NROD_USER=your_network_rail_username
 NROD_PASS=your_network_rail_password
 NR_ENABLED=true
 NR_AREA=T3
 ```
+
+`METRO_BOT_DATA_DIR` remains accepted as a migration fallback for an existing
+installation; do not move the live database merely to rename the variable.
 
 Reliable subscription settings:
 

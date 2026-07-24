@@ -25,7 +25,15 @@ from discord.ext import commands
 from dotenv import load_dotenv
 
 import t3_learner_clean as learner_mod
+from t3_snapshot_api import (
+    BerthCatalogue,
+    T3SnapshotAPIService,
+    T3SnapshotBuilder,
+    describe_catalogue,
+)
 
+load_dotenv("/etc/nr-bot.env")
+# Migration fallback for the historical deployment name.
 load_dotenv("/etc/metro-bot.env")
 load_dotenv()
 
@@ -137,6 +145,16 @@ class Config:
     nr_feed_tick_seconds: float
     nr_reconnect_initial_seconds: float
     nr_reconnect_max_seconds: float
+    t3_api_enabled: bool
+    t3_api_bind: str
+    t3_api_port: int
+    t3_api_server_cert: Path
+    t3_api_server_key: Path
+    t3_api_client_ca: Path
+    t3_api_allowed_client_cn: str
+    t3_api_stale_seconds: float
+    t3_api_berth_path: Path
+    t3_api_step_path: Path
     default_command_limit: int
     max_command_limit: int
 
@@ -146,14 +164,21 @@ def load_config() -> Config:
     if not token:
         raise RuntimeError("DISCORD_TOKEN is missing")
 
-    data_root = Path(os.getenv("METRO_BOT_DATA_DIR", "/var/lib/metro-bot")).expanduser()
+    # Keep the historical variable as a migration fallback, but new NR
+    # deployments should no longer share a Metro-named runtime root.
+    data_root = Path(
+        os.getenv("NRBOT_DATA_DIR")
+        or os.getenv("METRO_BOT_DATA_DIR")
+        or "/var/lib/nr-bot"
+    ).expanduser()
     learner_dir = data_root / "t3_learner"
+    app_dir = Path(__file__).resolve().parent
     guild_raw = os.getenv("DISCORD_GUILD_ID", "").strip()
 
     return Config(
         token=token,
         guild_id=int(guild_raw) if guild_raw else None,
-        app_dir=Path(__file__).resolve().parent,
+        app_dir=app_dir,
         learner_dir=learner_dir,
         db_path=learner_dir / "td_signal_bit_learner.sqlite",
         known_path=learner_dir / "known_bits.csv",
@@ -183,6 +208,36 @@ def load_config() -> Config:
         nr_feed_tick_seconds=env_float("NR_FEED_TICK_SECONDS", 1.0, minimum=0.2, maximum=10.0),
         nr_reconnect_initial_seconds=env_float("NR_RECONNECT_INITIAL_SECONDS", 10.0, minimum=1.0, maximum=300.0),
         nr_reconnect_max_seconds=env_float("NR_RECONNECT_MAX_SECONDS", 300.0, minimum=10.0, maximum=1800.0),
+        t3_api_enabled=env_bool("T3_API_ENABLED", False),
+        t3_api_bind=os.getenv("T3_API_BIND", "127.0.0.1").strip(),
+        t3_api_port=env_int("T3_API_PORT", 8765, minimum=1, maximum=65535),
+        t3_api_server_cert=Path(
+            os.getenv("T3_API_SERVER_CERT", "/etc/nr-bot/tls/server.crt")
+        ).expanduser(),
+        t3_api_server_key=Path(
+            os.getenv("T3_API_SERVER_KEY", "/etc/nr-bot/tls/server.key")
+        ).expanduser(),
+        t3_api_client_ca=Path(
+            os.getenv("T3_API_CLIENT_CA", "/etc/nr-bot/tls/ca.crt")
+        ).expanduser(),
+        t3_api_allowed_client_cn=os.getenv(
+            "T3_API_ALLOWED_CLIENT_CN", "metro-bot"
+        ).strip(),
+        t3_api_stale_seconds=env_float(
+            "T3_API_STALE_SECONDS", 180.0, minimum=10.0, maximum=3600.0
+        ),
+        t3_api_berth_path=Path(
+            os.getenv(
+                "T3_API_BERTH_DESCRIPTIONS",
+                str(app_dir / "berth-to-description.csv"),
+            )
+        ).expanduser(),
+        t3_api_step_path=Path(
+            os.getenv(
+                "T3_API_STEP_DESCRIPTIONS",
+                str(app_dir / "berth-step-to-description.csv"),
+            )
+        ).expanduser(),
         default_command_limit=env_int("NR_COMMAND_DEFAULT_LIMIT", 25, minimum=5, maximum=100),
         max_command_limit=env_int("NR_COMMAND_MAX_LIMIT", 100, minimum=10, maximum=500),
     )
@@ -986,6 +1041,8 @@ class Status:
         self.nr_connected = False
         self.nr_messages = 0
         self.nr_last_message_ts: Optional[float] = None
+        self.nr_t3_messages = 0
+        self.nr_last_t3_message_ts: Optional[float] = None
         self.nr_last_connect_ts: Optional[float] = None
         self.nr_last_disconnect_ts: Optional[float] = None
         self.nr_last_error = ""
@@ -1008,12 +1065,22 @@ class DiscordFeedListener:
         return str(headers.get("ack") or headers.get("message-id") or "")
 
     def on_message(self, frame: Any) -> None:
+        received_at = time.time()
         with STATUS.lock:
             STATUS.nr_messages += 1
-            STATUS.nr_last_message_ts = time.time()
+            STATUS.nr_last_message_ts = received_at
         ack_id = self._ack_id(frame)
         try:
             messages = list(learner_mod.iter_message_objects(frame.body))
+            t3_count = sum(
+                1
+                for _key, payload in messages
+                if str(payload.get("area_id") or "").strip().upper() == self.learner.area
+            )
+            if t3_count:
+                with STATUS.lock:
+                    STATUS.nr_t3_messages += t3_count
+                    STATUS.nr_last_t3_message_ts = received_at
             for key, payload in messages:
                 self.learner.handle_message(key, payload)
             # STOMP 1.2 ACK uses the MESSAGE frame's `ack` id. Acknowledge only
@@ -1197,8 +1264,56 @@ class NRFeedService:
 
 NR_SERVICE = NRFeedService()
 
+
+def _t3_api_feed_status() -> dict[str, Any]:
+    with STATUS.lock:
+        return {
+            "connected": STATUS.nr_connected,
+            "last_message_ts": STATUS.nr_last_t3_message_ts,
+        }
+
+
+T3_API_SERVICE: T3SnapshotAPIService | None = None
+T3_API_CONFIG_ERROR = ""
+if CFG.t3_api_enabled:
+    try:
+        _t3_catalogue = BerthCatalogue.load(
+            CFG.t3_api_berth_path,
+            CFG.t3_api_step_path,
+        )
+        print("[T3-API] " + " | ".join(describe_catalogue(_t3_catalogue)))
+        T3_API_SERVICE = T3SnapshotAPIService(
+            enabled=True,
+            bind_host=CFG.t3_api_bind,
+            bind_port=CFG.t3_api_port,
+            certificate=CFG.t3_api_server_cert,
+            private_key=CFG.t3_api_server_key,
+            client_ca=CFG.t3_api_client_ca,
+            allowed_client_cn=CFG.t3_api_allowed_client_cn,
+            builder=T3SnapshotBuilder(
+                db_path=CFG.db_path,
+                catalogue=_t3_catalogue,
+                area=CFG.nr_area,
+                stale_seconds=CFG.t3_api_stale_seconds,
+                busy_timeout_ms=CFG.db_busy_timeout_ms,
+            ),
+            feed_status=_t3_api_feed_status,
+        )
+    except Exception as exc:
+        T3_API_CONFIG_ERROR = f"{type(exc).__name__}: {exc}"
+        print(f"[T3-API] configuration error: {T3_API_CONFIG_ERROR}", file=sys.stderr)
+
+
+class NRDiscordBot(commands.Bot):
+    async def close(self) -> None:
+        if T3_API_SERVICE is not None:
+            await T3_API_SERVICE.stop()
+        await asyncio.to_thread(NR_SERVICE.stop, join=True)
+        await super().close()
+
+
 intents = discord.Intents.default()
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = NRDiscordBot(command_prefix="!", intents=intents)
 
 feed_group = app_commands.Group(
     name="feed",
@@ -1245,6 +1360,8 @@ async def on_ready() -> None:
 
         if CFG.nr_enabled:
             NR_SERVICE.start()
+        if T3_API_SERVICE is not None:
+            await T3_API_SERVICE.start()
         _READY_DONE = True
 
     print(f"Logged in as {bot.user} | slash commands synced | uptime {uptime_text(STATUS.started_ts)}")
@@ -1258,6 +1375,8 @@ async def status_cmd(interaction: discord.Interaction) -> None:
         nr_connected = STATUS.nr_connected
         nr_messages = STATUS.nr_messages
         nr_last_message_ts = STATUS.nr_last_message_ts
+        nr_t3_messages = STATUS.nr_t3_messages
+        nr_last_t3_message_ts = STATUS.nr_last_t3_message_ts
         nr_last_connect_ts = STATUS.nr_last_connect_ts
         nr_last_error = STATUS.nr_last_error
         nr_last_duration = STATUS.nr_last_connect_duration
@@ -1294,8 +1413,10 @@ async def status_cmd(interaction: discord.Interaction) -> None:
             f"Enabled: `{CFG.nr_enabled}`\n"
             f"Running: `{nr_running}`\n"
             f"Connected: `{nr_connected}`\n"
-            f"Messages: `{nr_messages}`\n"
-            f"Last message: `{fmt_ts(nr_last_message_ts)}`\n"
+            f"STOMP frames: `{nr_messages}`\n"
+            f"T3 messages: `{nr_t3_messages}`\n"
+            f"Last frame: `{fmt_ts(nr_last_message_ts)}`\n"
+            f"Last T3 message: `{fmt_ts(nr_last_t3_message_ts)}`\n"
             f"Last connect: `{fmt_ts(nr_last_connect_ts)}`\n"
             f"Last connected duration: `{duration_text}`"
         ),
@@ -1312,6 +1433,32 @@ async def status_cmd(interaction: discord.Interaction) -> None:
             f"Invalid messages: `{snapshot_info.get('invalid_messages', 0)}`\n"
             f"Duplicate deliveries ignored: `{snapshot_info.get('duplicate_messages', 0)}`\n"
             f"Reason: `{trim(str(snapshot_info.get('reason') or '-'), 300)}`"
+        ),
+        inline=False,
+    )
+    api_status = (
+        T3_API_SERVICE.status()
+        if T3_API_SERVICE is not None
+        else {
+            "enabled": CFG.t3_api_enabled,
+            "started": False,
+            "bind": f"{CFG.t3_api_bind}:{CFG.t3_api_port}",
+            "requests": 0,
+            "last_request_at": None,
+            "last_error": T3_API_CONFIG_ERROR,
+        }
+    )
+    api_error = str(api_status.get("last_error") or "")
+    embed.add_field(
+        name="Private T3 snapshot API",
+        value=(
+            f"Enabled: `{api_status.get('enabled', False)}`\n"
+            f"Listening: `{api_status.get('started', False)}`\n"
+            f"Private bind: `{api_status.get('bind')}`\n"
+            f"mTLS client CN: `{CFG.t3_api_allowed_client_cn}`\n"
+            f"Requests: `{api_status.get('requests', 0)}`\n"
+            f"Last request: `{fmt_ts(api_status.get('last_request_at'))}`\n"
+            f"Error: `{trim(api_error or '-', 300)}`"
         ),
         inline=False,
     )

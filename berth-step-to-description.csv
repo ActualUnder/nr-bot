@@ -1,0 +1,93 @@
+,P751,is at Pelaw P1
+,APUP,is at Pelaw P1
+P751,P765,has departed Pelaw P1
+APUP,,has departed Pelaw P1
+P765,6282,is at Pelaw Junction (in-line)
+6282,6276,has departed Pelaw Junction (in-line)
+6276,6274,is between PJC and FGT (berth 2)
+6274,6272,is approaching Fellgate P1
+6272,6268,is at Fellgate P1
+6268,6266,has departed Fellgate P1
+6266,6264,is approaching Brockley Whins P1
+6264,6254,is at Brockley Whins P1
+6254,6252,has departed Brockley Whins P1
+6252,6248,is between BYW and EBO (berth 2)
+6248,6246,is between BYW and EBO (berth 3)
+6246,6244,has entered East Boldon up-loop
+6244,6242,has departed East Boldon up-loop
+6246,6242,is at East Boldon P1
+6242,6238,has departed East Boldon P1
+6238,6236,is between EBO and SBN (berth 2)
+6236,6234,is approaching Seaburn P1
+6234,6232,is at Seaburn P1
+6232,6228,has departed Seaburn P1
+6228,6226,is approaching Stadium of Light P1
+6226,6224,is at Stadium of Light P1
+6224,6222,is at St Peter's P1
+6222,6208,has departed St Peter's P1
+6208,6206,is at Sunderland P2
+6206,6298,is at Park Lane P1
+6298,6294,is at University P1
+6294,6292,is at Millfield P1
+6292,6290,has departed Millfield P1
+6290,6288,is approaching/at Pallion P1
+6288,6286,has departed Pallion P1
+6286,6284,is between PAL and SHL (berth 2)
+6284,6280,is at South Hylton P1
+6280,6285,is at South Hylton P2
+6285,6287,has departed South Hylton
+6287,6289,is between SHL and PAL (berth 2)
+6289,6291,is approaching/at Pallion P2
+6291,6293,has departed Pallion P2
+6293,6295,is at Millfield P2
+6295,6297,is at University P2
+6297,6299,is at Park Lane P2
+6299,6207,is at Sunderland P3
+6207,6209,has departed Sunderland P3
+6209,6217,has departed Sunderland P4
+6217,6219,is approaching/at St Peter's P2
+6219,6223,has departed St Peter's P2 or is at Stadium of Light P2
+6223,6225,has departed Stadium of Light P2
+6225,6227,is approaching/at Seaburn P2
+6227,6229,has departed Seaburn P2
+6229,6233,is between SBN and EBO (berth 2)
+6233,6237,is between SBN and EBO (berth 3)
+6237,6239,is approaching/at East Boldon P2
+6239,6243,has departed East Boldon P2
+6243,6245,is between EBO and BYW (berth 2)
+6245,6247,is between EBO and BYW (berth 3)
+6247,6249,is approaching Brockley Whins P2
+6249,6265,is at or has departed Brockley Whins P2
+6265,6267,is approaching Fellgate P2
+6267,6269,is at Fellgate P2
+6269,6273,has departed Fellgate P2
+6273,6275,is between FGT and PJC (berth 2)
+6275,6277,is between FGT and PJC (berth 3)
+6277,6279,is between FGT and PJC (berth 4)
+6279,P764,is approaching/at Pelaw Junction (out-line)
+P764,,has departed Pelaw Junction (out-line)
+,LSDP,has departed Pelaw Junction (out-line)
+P764,GSFH,is at Pelaw P2
+,P773,is between PLW and HEB (berth 1)
+P773,P775,is between PLW and HEB (berth 2)
+P775,P789,is approaching/at Hebburn P1
+P789,P803,has departed Hebburn P1
+P803,P807,is approaching/at Jarrow P1
+P807,,has departed Jarrow P1
+,P804,is near Jarrow P2
+P804,P802,has departed Jarrow P2
+P802,P790,is approaching/at Hebburn P2
+P790,P776,has departed Hebburn P2
+P776,P770,is between HEB and PLW (berth 2)
+P770,,is between HEB and PLW (berth 3)
+6299,6213,has arrived at Sunderland P2 (from Park Lane)
+6212,6298,has departed Sunderland P3 (towards Park Lane)
+6222,6214,has arrived at Sunderland P4 (from St Peter's)
+6209,6217,has arrived at Sunderland P1 (from St Peter's)
+6279,0019,is between FGT and HTH (main line)
+5310,6278,is between HTH (main line) and FGT
+5312,6278,is between HTH (main line) and FGT
+6264,TDEN,has went up Boldon North Junction (from FGT towards Tyne Dock)
+6264,00P2,has went up Boldon North Junction (from FGT towards Tyne Dock)
+6247,TDEN,has went up Boldon North Junction (from EBO towards Tyne Dock)
+6247,00P2,has went up Boldon North Junction (from EBO towards Tyne Dock)
