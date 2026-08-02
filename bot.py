@@ -27,6 +27,7 @@ from dotenv import load_dotenv
 import t3_learner_clean as learner_mod
 from t3_snapshot_api import (
     BerthCatalogue,
+    T3EventBuilder,
     T3SnapshotAPIService,
     T3SnapshotBuilder,
     describe_catalogue,
@@ -153,6 +154,7 @@ class Config:
     t3_api_client_ca: Path
     t3_api_allowed_client_cn: str
     t3_api_stale_seconds: float
+    t3_api_event_retention_days: float
     t3_api_berth_path: Path
     t3_api_step_path: Path
     default_command_limit: int
@@ -225,6 +227,9 @@ def load_config() -> Config:
         ).strip(),
         t3_api_stale_seconds=env_float(
             "T3_API_STALE_SECONDS", 180.0, minimum=10.0, maximum=3600.0
+        ),
+        t3_api_event_retention_days=env_float(
+            "T3_API_EVENT_RETENTION_DAYS", 7.0, minimum=1.0, maximum=365.0
         ),
         t3_api_berth_path=Path(
             os.getenv(
@@ -1082,7 +1087,7 @@ class DiscordFeedListener:
                     STATUS.nr_t3_messages += t3_count
                     STATUS.nr_last_t3_message_ts = received_at
             for key, payload in messages:
-                self.learner.handle_message(key, payload)
+                self.learner.handle_message(key, payload, received_ts=received_at)
             # STOMP 1.2 ACK uses the MESSAGE frame's `ack` id. Acknowledge only
             # after every inner TD message has been committed; database failures
             # therefore remain eligible for durable redelivery.
@@ -1297,6 +1302,12 @@ if CFG.t3_api_enabled:
                 stale_seconds=CFG.t3_api_stale_seconds,
                 busy_timeout_ms=CFG.db_busy_timeout_ms,
             ),
+            event_builder=T3EventBuilder(
+                db_path=CFG.db_path,
+                catalogue=_t3_catalogue,
+                area=CFG.nr_area,
+                busy_timeout_ms=CFG.db_busy_timeout_ms,
+            ),
             feed_status=_t3_api_feed_status,
         )
     except Exception as exc:
@@ -1444,19 +1455,30 @@ async def status_cmd(interaction: discord.Interaction) -> None:
             "started": False,
             "bind": f"{CFG.t3_api_bind}:{CFG.t3_api_port}",
             "requests": 0,
+            "snapshot_requests": 0,
+            "event_requests": 0,
+            "event_stream_id": "",
+            "retained_events": 0,
+            "retained_from": None,
+            "retained_to": None,
             "last_request_at": None,
             "last_error": T3_API_CONFIG_ERROR,
         }
     )
     api_error = str(api_status.get("last_error") or "")
     embed.add_field(
-        name="Private T3 snapshot API",
+        name="Private T3 bridge API",
         value=(
             f"Enabled: `{api_status.get('enabled', False)}`\n"
             f"Listening: `{api_status.get('started', False)}`\n"
             f"Private bind: `{api_status.get('bind')}`\n"
             f"mTLS client CN: `{CFG.t3_api_allowed_client_cn}`\n"
-            f"Requests: `{api_status.get('requests', 0)}`\n"
+            f"Requests: `{api_status.get('snapshot_requests', 0)}` snapshot / "
+            f"`{api_status.get('event_requests', 0)}` events\n"
+            f"Event stream: `{trim(str(api_status.get('event_stream_id') or 'not read yet'), 32)}`\n"
+            f"Retained events: `{api_status.get('retained_events', 0)}` "
+            f"(`{api_status.get('retained_from') or '-'}` to `{api_status.get('retained_to') or '-'}`)\n"
+            f"Retention: `{CFG.t3_api_event_retention_days:g} days`\n"
             f"Last request: `{fmt_ts(api_status.get('last_request_at'))}`\n"
             f"Error: `{trim(api_error or '-', 300)}`"
         ),
