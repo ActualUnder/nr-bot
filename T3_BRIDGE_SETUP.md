@@ -1,12 +1,15 @@
 # Private T3 bridge setup
 
-This release links the two bots with one read-only endpoint:
+This release links the two bots with two read-only endpoints:
 
 ```text
 GET https://<NR private IP>:8765/v1/t3/snapshot
+GET https://<NR private IP>:8765/v1/t3/events?after=<cursor>&limit=<n>
 ```
 
-It exposes current-connection T3 berth occupations only. There is no SQL,
+The snapshot exposes current-connection T3 berth occupations only. The event
+endpoint exposes the retained, cursor-addressed `CA`/`CC`/`CB` movement log.
+There is no SQL,
 write, restart, upload, signal-control or credential endpoint.
 
 ## Safety model
@@ -21,8 +24,11 @@ write, restart, upload, signal-control or credential endpoint.
 - Persisted occupations from an earlier feed connection are withheld.
 - An NR position is positive evidence only. Missing NR data never proves that
   a Metro train is absent or out of service.
-- Phase one is display-only. It does not change Metro alerts, withdrawal
-  detection, delays, allocations or timetable state.
+- Metro keeps passenger-service state (POP) separate from physical train state
+  (T3). T3 presence cannot label a train as carrying passengers.
+- Metro's new T3 operational alerts are built but disabled by default. They
+  require both a global Metro environment opt-in and a per-Discord-server
+  category opt-in.
 
 The supplied catalogue contains the normal Pelaw–South Hylton berths, the
 Hebburn–Jarrow TWPS chain, and the supplied main-line boundary berths.
@@ -125,6 +131,7 @@ T3_API_SERVER_KEY=/etc/nr-bot/tls/server.key
 T3_API_CLIENT_CA=/etc/nr-bot/tls/ca.crt
 T3_API_ALLOWED_CLIENT_CN=metro-bot
 T3_API_STALE_SECONDS=180
+T3_API_EVENT_RETENTION_DAYS=7
 ```
 
 Existing installs can temporarily retain `METRO_BOT_DATA_DIR`; it remains a
@@ -158,7 +165,7 @@ Restart the NR bot first, then the Metro bot. On the NR Discord bot, `/status`
 should show:
 
 ```text
-Private T3 snapshot API
+Private T3 bridge API
 Enabled: true
 Listening: true
 ```
@@ -176,11 +183,47 @@ curl --fail --silent --show-error \
 
 A request without the client certificate must fail during the TLS handshake.
 
-Metro refreshes the snapshot during its normal train poll. `/active` adds an
-`NR <berth>` suffix where there is current positive evidence and places Green
-Line trains absent from POP in a separate **NR-confirmed, not on Metro API**
-section. `/train` adds a detailed Network Rail field. The regular Metro status
-and alert logic remains independent.
+Verify the cursor stream separately:
+
+```bash
+curl --fail --silent --show-error \
+  --cacert /etc/metro-bot/tls/ca.crt \
+  --cert /etc/metro-bot/tls/client.crt \
+  --key /etc/metro-bot/tls/client.key \
+  'https://10.77.0.1:8765/v1/t3/events?after=0&limit=20' \
+  | python -m json.tool
+```
+
+Metro refreshes the snapshot and consumes outstanding events during its normal
+train poll, before deciding whether a POP train has disappeared. `/active`,
+`/train`, `/map` and `/status` show source-aware results. `/t3` contains the
+`live`, `train`, `traffic`, `compare`, `history` and `health` subcommands.
+
+If POP removes a booked train while T3 still detects it, Metro describes it as
+physically tracked but absent from passenger tracking—likely withdrawn from
+passenger service, with a possible fault that is explicitly not confirmed.
+That inference does not automatically create a confirmed unit-failure record;
+normal failure review/evidence is still required. T3 absence still proves
+nothing.
+
+On a test Metro instance, operational alerts can be enabled with:
+
+```env
+NR_T3_ALERTS_ENABLED=true
+```
+
+Then use Metro's `/alerts` command to enable **T3 Operational Analysis (Test)**
+only on the intended Discord test server. Both switches are off after an
+upgrade, so production servers do not start receiving these alerts by accident.
+
+Existing generic POP disappearance alerts continue as before. The extra T3
+withdrawal/possible-fault interpretation is selected per guild and is only
+rendered where that T3 category is enabled.
+
+The event table is retained for `T3_API_EVENT_RETENTION_DAYS` (seven days by
+default). A fresh Metro install can backfill retained movements. If a cursor is
+older than the retained range, the response marks it expired and Metro uses the
+snapshot as its recovery baseline before continuing.
 
 ## Snapshot freshness after restart
 

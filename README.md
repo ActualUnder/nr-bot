@@ -1,18 +1,22 @@
 # Metro T3 Network Rail Protocol Bot
 
-## Private T3 snapshot bridge
+## Private T3 snapshot and event bridge
 
-This release adds one optional, read-only endpoint for the separate Metro bot:
+This release provides two optional, read-only endpoints for the separate Metro bot:
 
 ```text
 GET /v1/t3/snapshot
+GET /v1/t3/events?after=<cursor>&limit=<1..500>
 ```
 
 It binds only to a configured private address, uses HTTPS with mandatory client
 certificates, authorises the `metro-bot` certificate identity, and exposes T3
 berth snapshots only. C-Class berth rows are stamped with a connection
 generation so occupations left behind by a feed outage are withheld after
-reconnect. See [T3_BRIDGE_SETUP.md](T3_BRIDGE_SETUP.md).
+reconnect. Accepted `CA`, `CC` and `CB` messages are also written once to a
+durable monotonic event log. Metro can therefore consume every retained step,
+interpose and cancel without relying on a 30-second snapshot interval. See
+[T3_BRIDGE_SETUP.md](T3_BRIDGE_SETUP.md).
 
 ## July 2026 command and timezone hotfix
 
@@ -38,6 +42,11 @@ headcode moved from berth A to berth B
 It is no longer described internally as proof that the train physically passed signal A at that exact instant. The canonical table is `berth_steps`.
 
 `CB` and `CC` continue to maintain the latest berth/headcode cache.
+
+All three accepted C-Class movement types also populate `t3_bridge_events`.
+The stream keeps its identity in `t3_bridge_event_meta`, preserves the headcode
+on cancellation, and uses the existing protocol fingerprint to avoid duplicate
+events after durable redelivery.
 
 ### S-Class messages are treated differently by type
 
@@ -184,6 +193,8 @@ feed_state
 refresh_history
 s_snapshot_differences
 berth_steps
+t3_bridge_event_meta
+t3_bridge_events
 signal_observation_sessions
 signal_observations
 ```
@@ -224,6 +235,12 @@ NR_REFRESH_MAX_GAP_SECONDS=60
 NR_REFRESH_EXPECTED_START_ADDRESS=00
 # Lower bound only; the bot also requires enough bytes to cover known_bits.csv.
 NR_REFRESH_MIN_BYTES=8
+```
+
+Private bridge event retention defaults to seven days:
+
+```env
+T3_API_EVENT_RETENTION_DAYS=7
 ```
 
 Normal feed settings:

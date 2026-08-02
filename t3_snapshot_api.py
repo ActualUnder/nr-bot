@@ -515,6 +515,208 @@ class T3SnapshotBuilder:
         return payload
 
 
+class T3EventBuilder:
+    """Read the durable C-Class log through a monotonic cursor."""
+
+    schema_version = 1
+
+    def __init__(
+        self,
+        *,
+        db_path: Path,
+        catalogue: BerthCatalogue,
+        area: str = "T3",
+        busy_timeout_ms: int = 5000,
+        maximum_limit: int = 500,
+    ) -> None:
+        self.db_path = Path(db_path)
+        self.catalogue = catalogue
+        self.area = str(area or "").strip().upper()
+        self.busy_timeout_ms = max(250, int(busy_timeout_ms))
+        self.maximum_limit = max(1, min(1000, int(maximum_limit)))
+        self.last_stream_id = ""
+        self.last_retained_events = 0
+        self.last_retained_from: int | None = None
+        self.last_retained_to: int | None = None
+        self.last_error = ""
+
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(
+            f"file:{self.db_path}?mode=ro",
+            uri=True,
+            timeout=self.busy_timeout_ms / 1000.0,
+        )
+        connection.row_factory = sqlite3.Row
+        connection.execute(f"PRAGMA busy_timeout={self.busy_timeout_ms}")
+        connection.execute("PRAGMA query_only=ON")
+        return connection
+
+    @staticmethod
+    def _table_exists(connection: sqlite3.Connection, table: str) -> bool:
+        return connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (table,),
+        ).fetchone() is not None
+
+    def _fallback_stream_id(self) -> str:
+        try:
+            stat = self.db_path.stat()
+            identity = (
+                f"{self.db_path.resolve()}|{stat.st_dev}|{stat.st_ino}|"
+                f"{stat.st_ctime_ns}"
+            )
+        except OSError:
+            identity = f"{self.db_path.resolve()}|not-created"
+        return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+
+    def _event_payload(self, row: sqlite3.Row) -> dict[str, Any]:
+        headcode = str(row["headcode"] or "").strip().upper()
+        from_berth = normalize_berth(row["from_berth"]) or None
+        to_berth = normalize_berth(row["to_berth"]) or None
+        from_descriptions = self.catalogue.descriptions_for(from_berth or "")
+        to_descriptions = self.catalogue.descriptions_for(to_berth or "")
+        step_texts = self.catalogue.step_texts_for(
+            from_berth or "",
+            to_berth or "",
+        )
+        alternatives: list[str] = []
+        for candidate in (
+            *from_descriptions[1:],
+            *to_descriptions[1:],
+            *step_texts[1:],
+        ):
+            if candidate not in alternatives:
+                alternatives.append(candidate)
+        return {
+            "event_id": int(row["id"]),
+            "event_type": str(row["event_type"] or "").strip().upper(),
+            "headcode": headcode,
+            "tdn": metro_tdn_for_headcode(headcode),
+            "is_metro": bool(METRO_HEADCODE_RE.fullmatch(headcode)),
+            "from_berth": from_berth,
+            "to_berth": to_berth,
+            "from_description": from_descriptions[0] if from_descriptions else None,
+            "to_description": to_descriptions[0] if to_descriptions else None,
+            "description_alternatives": alternatives,
+            "at": iso_utc(float(row["event_ts"])),
+            "received_at": iso_utc(float(row["received_ts"])),
+            "connection_generation": int(row["connection_generation"] or 0),
+            "quality": "live_current_connection",
+            "direction": None,
+            "route_context": step_texts[0] if step_texts else None,
+            "next_berths": list(
+                self.catalogue.next_berths.get(to_berth or "", ())
+            ),
+            "conflict_groups": [],
+        }
+
+    def build(
+        self,
+        *,
+        after_event_id: int = 0,
+        limit: int = 200,
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        now = float(now if now is not None else time.time())
+        after = max(0, int(after_event_id))
+        page_limit = max(1, min(self.maximum_limit, int(limit)))
+        stream_id = self._fallback_stream_id()
+        rows: list[sqlite3.Row] = []
+        cursor_expired = False
+        has_more = False
+        retained_from: int | None = None
+        retained_to: int | None = None
+        retained_events = 0
+        next_after = after
+
+        if self.area == "T3" and self.db_path.exists():
+            try:
+                with contextlib.closing(self._connect()) as connection:
+                    if self._table_exists(connection, "t3_bridge_event_meta"):
+                        meta = connection.execute(
+                            "SELECT stream_id FROM t3_bridge_event_meta WHERE area=?",
+                            (self.area,),
+                        ).fetchone()
+                        if meta and str(meta["stream_id"] or "").strip():
+                            stream_id = str(meta["stream_id"]).strip()
+
+                    if self._table_exists(connection, "t3_bridge_events"):
+                        range_row = connection.execute(
+                            """
+                            SELECT MIN(id) AS minimum_id,MAX(id) AS maximum_id,
+                                   COUNT(*) AS event_count
+                            FROM t3_bridge_events WHERE area=?
+                            """,
+                            (self.area,),
+                        ).fetchone()
+                        retained_events = int(range_row["event_count"] or 0)
+                        retained_from = (
+                            int(range_row["minimum_id"])
+                            if range_row["minimum_id"] is not None
+                            else None
+                        )
+                        retained_to = (
+                            int(range_row["maximum_id"])
+                            if range_row["maximum_id"] is not None
+                            else None
+                        )
+                        cursor_expired = bool(
+                            after > 0
+                            and (
+                                retained_from is None
+                                or after < retained_from - 1
+                                or (retained_to is not None and after > retained_to)
+                            )
+                        )
+                        effective_after = (
+                            max(0, retained_from - 1)
+                            if cursor_expired and retained_from is not None
+                            else 0 if cursor_expired else after
+                        )
+                        rows = list(
+                            connection.execute(
+                                """
+                                SELECT * FROM t3_bridge_events
+                                WHERE area=? AND id>?
+                                ORDER BY id ASC LIMIT ?
+                                """,
+                                (self.area, effective_after, page_limit + 1),
+                            ).fetchall()
+                        )
+                        has_more = len(rows) > page_limit
+                        rows = rows[:page_limit]
+                        if rows:
+                            next_after = int(rows[-1]["id"])
+                        elif cursor_expired:
+                            next_after = effective_after
+            except (OSError, sqlite3.Error, ValueError) as exc:
+                self.last_error = f"{type(exc).__name__}: {exc}"
+                LOGGER.exception("Could not build T3 event page")
+                raise RuntimeError("T3 event database is temporarily unavailable") from exc
+
+        self.last_stream_id = stream_id
+        self.last_retained_events = retained_events
+        self.last_retained_from = retained_from
+        self.last_retained_to = retained_to
+        self.last_error = ""
+        return {
+            "api_version": self.schema_version,
+            "generated_at": iso_utc(now),
+            "signal_area": self.area,
+            "event_mode": "confirmed_movement_log",
+            "absence_is_evidence": False,
+            "stream_id": stream_id,
+            "after_event_id": after,
+            "next_after": next_after,
+            "has_more": has_more,
+            "cursor_expired": cursor_expired,
+            "retained_from": retained_from,
+            "retained_to": retained_to,
+            "retained_events": retained_events,
+            "events": [self._event_payload(row) for row in rows],
+        }
+
+
 def create_server_ssl_context(
     *,
     certificate: Path,
@@ -571,7 +773,7 @@ def validate_private_bind_address(host: str) -> None:
 
 
 class T3SnapshotAPIService:
-    """Small aiohttp service hosted inside the existing NR bot process."""
+    """Small mTLS bridge service hosted inside the existing NR bot process."""
 
     def __init__(
         self,
@@ -585,6 +787,7 @@ class T3SnapshotAPIService:
         allowed_client_cn: str,
         builder: T3SnapshotBuilder,
         feed_status: Callable[[], dict[str, Any]],
+        event_builder: T3EventBuilder | None = None,
     ) -> None:
         self.enabled = bool(enabled)
         self.bind_host = str(bind_host or "").strip()
@@ -594,6 +797,12 @@ class T3SnapshotAPIService:
         self.client_ca = Path(client_ca)
         self.allowed_client_cn = str(allowed_client_cn or "").strip()
         self.builder = builder
+        self.event_builder = event_builder or T3EventBuilder(
+            db_path=builder.db_path,
+            catalogue=builder.catalogue,
+            area=builder.area,
+            busy_timeout_ms=builder.busy_timeout_ms,
+        )
         self.feed_status = feed_status
         self._runner: web.AppRunner | None = None
         self._site: web.TCPSite | None = None
@@ -601,6 +810,8 @@ class T3SnapshotAPIService:
         self.started_at: float | None = None
         self.last_error = ""
         self.requests = 0
+        self.snapshot_requests = 0
+        self.event_requests = 0
         self.last_request_at: float | None = None
 
     async def start(self) -> None:
@@ -619,6 +830,7 @@ class T3SnapshotAPIService:
             )
             application = web.Application(client_max_size=64 * 1024)
             application.router.add_get("/v1/t3/snapshot", self._snapshot)
+            application.router.add_get("/v1/t3/events", self._events)
             self._runner = web.AppRunner(
                 application,
                 access_log=LOGGER,
@@ -637,7 +849,7 @@ class T3SnapshotAPIService:
             self.started_at = time.time()
             self.last_error = ""
             LOGGER.info(
-                "T3 mTLS snapshot API listening on https://%s:%s/v1/t3/snapshot",
+                "T3 mTLS bridge API listening on https://%s:%s/v1/t3/snapshot and /v1/t3/events",
                 self.bind_host,
                 self.bind_port,
             )
@@ -657,12 +869,23 @@ class T3SnapshotAPIService:
         self._site = None
         self.started = False
 
-    async def _snapshot(self, request: web.Request) -> web.Response:
+    def _authorise(self, request: web.Request) -> None:
         peer_certificate = request.transport.get_extra_info("peercert") if request.transport else None
         common_names = certificate_common_names(peer_certificate)
         if self.allowed_client_cn not in common_names:
-            LOGGER.warning("Rejected T3 snapshot client certificate CNs=%s", sorted(common_names))
+            LOGGER.warning("Rejected T3 bridge client certificate CNs=%s", sorted(common_names))
             raise web.HTTPForbidden(text="client certificate identity is not authorised")
+
+    def _mark_request(self, *, event: bool) -> None:
+        self.requests += 1
+        if event:
+            self.event_requests += 1
+        else:
+            self.snapshot_requests += 1
+        self.last_request_at = time.time()
+
+    async def _snapshot(self, request: web.Request) -> web.Response:
+        self._authorise(request)
 
         status = self.feed_status()
         snapshot = await asyncio.to_thread(
@@ -670,10 +893,47 @@ class T3SnapshotAPIService:
             connected=bool(status.get("connected")),
             last_message_ts=status.get("last_message_ts"),
         )
-        self.requests += 1
-        self.last_request_at = time.time()
+        self._mark_request(event=False)
         return web.json_response(
             snapshot,
+            headers={
+                "Cache-Control": "no-store",
+                "Pragma": "no-cache",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+
+    async def _events(self, request: web.Request) -> web.Response:
+        self._authorise(request)
+        raw_after = str(request.query.get("after", "0")).strip()
+        raw_limit = str(request.query.get("limit", "200")).strip()
+        if not raw_after.isdigit():
+            raise web.HTTPBadRequest(text="after must be a non-negative integer")
+        if not raw_limit.isdigit():
+            raise web.HTTPBadRequest(text="limit must be a positive integer")
+        after = int(raw_after)
+        limit = int(raw_limit)
+        if after < 0:
+            raise web.HTTPBadRequest(text="after must be a non-negative integer")
+        if not 1 <= limit <= self.event_builder.maximum_limit:
+            raise web.HTTPBadRequest(
+                text=f"limit must be between 1 and {self.event_builder.maximum_limit}"
+            )
+        try:
+            page = await asyncio.to_thread(
+                self.event_builder.build,
+                after_event_id=after,
+                limit=limit,
+            )
+            self.last_error = ""
+        except Exception as exc:
+            self.last_error = f"{type(exc).__name__}: {exc}"
+            raise web.HTTPServiceUnavailable(
+                text="T3 event stream is temporarily unavailable"
+            ) from exc
+        self._mark_request(event=True)
+        return web.json_response(
+            page,
             headers={
                 "Cache-Control": "no-store",
                 "Pragma": "no-cache",
@@ -688,7 +948,14 @@ class T3SnapshotAPIService:
             "bind": f"{self.bind_host}:{self.bind_port}",
             "started_at": self.started_at,
             "requests": self.requests,
+            "snapshot_requests": self.snapshot_requests,
+            "event_requests": self.event_requests,
             "last_request_at": self.last_request_at,
+            "event_stream_id": self.event_builder.last_stream_id,
+            "retained_events": self.event_builder.last_retained_events,
+            "retained_from": self.event_builder.last_retained_from,
+            "retained_to": self.event_builder.last_retained_to,
+            "event_error": self.event_builder.last_error,
             "last_error": self.last_error,
         }
 

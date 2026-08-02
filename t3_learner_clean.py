@@ -42,6 +42,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import signal as signal_module
 import sqlite3
 import statistics
@@ -636,6 +637,7 @@ class Store:
         self.conn.create_function("norm_berth", 1, normalize_berth)
         self.lock = threading.RLock()
         self.read_only = False
+        self._last_bridge_event_prune_ts = 0.0
         try:
             self._init_schema()
         except sqlite3.OperationalError as exc:
@@ -829,6 +831,31 @@ class Store:
                     UNIQUE(area, event_ts, from_berth, to_berth, descr)
                 );
 
+                -- Durable, cursor-addressable C-Class movement stream consumed by
+                -- Metro bot.  This is deliberately separate from berth_steps:
+                -- interpose (CC) and cancel (CB) messages are operational events
+                -- even though they are not CA learning windows.
+                CREATE TABLE IF NOT EXISTS t3_bridge_event_meta (
+                    area TEXT PRIMARY KEY,
+                    stream_id TEXT NOT NULL,
+                    created_ts REAL NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS t3_bridge_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    area TEXT NOT NULL,
+                    source_fingerprint TEXT NOT NULL UNIQUE,
+                    event_type TEXT NOT NULL,
+                    headcode TEXT NOT NULL,
+                    from_berth TEXT,
+                    to_berth TEXT,
+                    event_ts REAL NOT NULL,
+                    received_ts REAL NOT NULL,
+                    connection_generation INTEGER NOT NULL,
+                    source_msg_type TEXT NOT NULL,
+                    raw_json TEXT DEFAULT ''
+                );
+
                 CREATE TABLE IF NOT EXISTS signal_observation_sessions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     signal TEXT NOT NULL,
@@ -858,6 +885,10 @@ class Store:
                 CREATE INDEX IF NOT EXISTS idx_pass_signal ON pass_log(signal, to_berth, finalised_ts);
                 CREATE INDEX IF NOT EXISTS idx_steps_from_time ON berth_steps(from_berth, event_ts);
                 CREATE INDEX IF NOT EXISTS idx_steps_time ON berth_steps(event_ts);
+                CREATE INDEX IF NOT EXISTS idx_t3_bridge_events_area_id
+                    ON t3_bridge_events(area,id);
+                CREATE INDEX IF NOT EXISTS idx_t3_bridge_events_received
+                    ON t3_bridge_events(area,received_ts);
                 CREATE INDEX IF NOT EXISTS idx_snapshot_diff_generation ON s_snapshot_differences(area, generation);
                 CREATE INDEX IF NOT EXISTS idx_observation_signal ON signal_observations(signal, observed_ts);
                 CREATE INDEX IF NOT EXISTS idx_missing_last ON missing_topology_summary(last_ts);
@@ -898,6 +929,16 @@ class Store:
                        0, COALESCE(special_reason,''), ''
                 FROM pass_log
             """)
+
+            # A persisted stream identity lets clients distinguish an ordinary
+            # cursor gap from a replaced/rebuilt learner database.
+            self.conn.execute(
+                """
+                INSERT OR IGNORE INTO t3_bridge_event_meta(area,stream_id,created_ts)
+                VALUES('T3',?,?)
+                """,
+                (secrets.token_hex(12), time.time()),
+            )
 
     def load_bytes(self, area: str) -> Dict[int, int]:
         with self.lock:
@@ -1368,6 +1409,113 @@ class Store:
                 str(msg_type or ""),
                 max(0, int(connection_generation)),
             ))
+
+    def current_berth_headcode(self, berth: str) -> str:
+        """Return the live description before a CB clears its berth."""
+        canonical = normalize_berth(berth)
+        if not canonical:
+            return ""
+        with self.lock:
+            row = self.conn.execute(
+                """
+                SELECT descr FROM berth_state
+                WHERE berth=? AND occupied=1
+                """,
+                (canonical,),
+            ).fetchone()
+        return str(row["descr"] or "").strip().upper() if row else ""
+
+    def record_bridge_event(
+        self,
+        *,
+        area: str,
+        source_fingerprint: str,
+        event_type: str,
+        headcode: str,
+        from_berth: str,
+        to_berth: str,
+        event_ts: float,
+        received_ts: float,
+        connection_generation: int,
+        source_msg_type: str,
+        raw: Dict[str, Any],
+    ) -> int:
+        """Append one deduplicated C-Class event to Metro's durable stream."""
+        if getattr(self, "read_only", False):
+            return 0
+        area = str(area or "").strip().upper()
+        fingerprint = str(source_fingerprint or "").strip()
+        event_type = str(event_type or "").strip().upper()
+        headcode = str(headcode or "").strip().upper()
+        generation = int(connection_generation or 0)
+        if (
+            not area
+            or not fingerprint
+            or event_type not in {"STEP", "INTERPOSE", "CANCEL"}
+            or not headcode
+            or generation <= 0
+        ):
+            return 0
+
+        canonical_from = normalize_berth(from_berth)
+        canonical_to = normalize_berth(to_berth)
+        if event_type in {"STEP", "INTERPOSE"} and not canonical_to:
+            return 0
+        if event_type == "CANCEL" and not canonical_from:
+            return 0
+
+        received = float(received_ts)
+        with self.lock, self.conn:
+            self.conn.execute(
+                """
+                INSERT OR IGNORE INTO t3_bridge_event_meta(area,stream_id,created_ts)
+                VALUES(?,?,?)
+                """,
+                (area, secrets.token_hex(12), received),
+            )
+            self.conn.execute(
+                """
+                INSERT OR IGNORE INTO t3_bridge_events(
+                    area,source_fingerprint,event_type,headcode,from_berth,
+                    to_berth,event_ts,received_ts,connection_generation,
+                    source_msg_type,raw_json
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    area,
+                    fingerprint,
+                    event_type,
+                    headcode,
+                    canonical_from or None,
+                    canonical_to or None,
+                    float(event_ts),
+                    received,
+                    generation,
+                    str(source_msg_type or "").strip().upper(),
+                    json.dumps(raw, sort_keys=True, separators=(",", ":")),
+                ),
+            )
+            row = self.conn.execute(
+                "SELECT id FROM t3_bridge_events WHERE source_fingerprint=?",
+                (fingerprint,),
+            ).fetchone()
+
+            # Bound storage without tying event availability to API uptime.
+            # Pruning is deliberately no more frequent than hourly.
+            if received - self._last_bridge_event_prune_ts >= 3600.0:
+                try:
+                    retention_days = float(
+                        os.getenv("T3_API_EVENT_RETENTION_DAYS", "7") or "7"
+                    )
+                except (TypeError, ValueError):
+                    retention_days = 7.0
+                retention_days = min(365.0, max(1.0, retention_days))
+                self.conn.execute(
+                    "DELETE FROM t3_bridge_events WHERE area=? AND received_ts<?",
+                    (area, received - retention_days * 86400.0),
+                )
+                self._last_bridge_event_prune_ts = received
+        return int(row["id"] if row else 0)
 
     def record_raw_bit_event(self, event: BitEvent) -> None:
         """Store the real S-Class bit change once.
@@ -1961,7 +2109,13 @@ class Learner:
         self.refresh_message_count = 0
         self.refresh_next_address = None
 
-    def handle_message(self, key: str, msg: Dict[str, Any]) -> None:
+    def handle_message(
+        self,
+        key: str,
+        msg: Dict[str, Any],
+        *,
+        received_ts: Optional[float] = None,
+    ) -> None:
         area = str(msg.get("area_id", "")).upper()
         if area != self.area:
             return
@@ -1977,8 +2131,13 @@ class Learner:
             print(f"[WARN] Invalid {msg_type} ignored: {exc} {msg!r}", file=sys.stderr)
             return
 
-        is_new, _fingerprint = self.store.record_raw_message(
-            area=self.area, msg_type=msg_type, msg=msg, event_ts=ts,
+        received = float(received_ts if received_ts is not None else time.time())
+        is_new, fingerprint = self.store.record_raw_message(
+            area=self.area,
+            msg_type=msg_type,
+            msg=msg,
+            event_ts=ts,
+            received_ts=received,
         )
         if not is_new:
             if self.print_s or self.print_c:
@@ -1990,7 +2149,13 @@ class Learner:
             self._handle_s(msg_type, msg, ts)
         else:
             self.store.touch_feed_event(self.area, "C", ts)
-            self._handle_c(msg_type, msg, ts)
+            self._handle_c(
+                msg_type,
+                msg,
+                ts,
+                received_ts=received,
+                source_fingerprint=fingerprint,
+            )
 
     def _handle_s(self, msg_type: str, msg: Dict[str, Any], ts: float) -> None:
         try:
@@ -2202,7 +2367,15 @@ class Learner:
             if berth:
                 self.berth_ts[berth] = max(float(ts), float(self.berth_ts.get(berth, 0.0)))
 
-    def _handle_c(self, msg_type: str, msg: Dict[str, Any], ts: float) -> None:
+    def _handle_c(
+        self,
+        msg_type: str,
+        msg: Dict[str, Any],
+        ts: float,
+        *,
+        received_ts: float,
+        source_fingerprint: str,
+    ) -> None:
         if self.print_c and msg_type != "CT":
             print(f"[C] {fmt_ts(ts)} {msg_type} {msg}")
 
@@ -2219,6 +2392,7 @@ class Learner:
                     if self.print_c:
                         print(f"[C-SKIP-STALE] {fmt_ts(ts)} {msg_type} {berth} newer={fmt_ts(self.berth_ts.get(berth))}")
                     return
+                headcode = descr or self.store.current_berth_headcode(berth)
                 self._mark_berth_ts(ts, berth)
                 self.store.record_berth_state(
                     berth,
@@ -2227,6 +2401,19 @@ class Learner:
                     ts,
                     msg_type,
                     self.connection_generation,
+                )
+                self.store.record_bridge_event(
+                    area=self.area,
+                    source_fingerprint=source_fingerprint,
+                    event_type="CANCEL",
+                    headcode=headcode,
+                    from_berth=berth,
+                    to_berth="",
+                    event_ts=ts,
+                    received_ts=received_ts,
+                    connection_generation=self.connection_generation,
+                    source_msg_type=msg_type,
+                    raw=msg,
                 )
                 self._check_missing_topology(ts, descr, berth, berth, msg)
             return
@@ -2247,6 +2434,19 @@ class Learner:
                     ts,
                     msg_type,
                     self.connection_generation,
+                )
+                self.store.record_bridge_event(
+                    area=self.area,
+                    source_fingerprint=source_fingerprint,
+                    event_type="INTERPOSE",
+                    headcode=descr,
+                    from_berth="",
+                    to_berth=berth,
+                    event_ts=ts,
+                    received_ts=received_ts,
+                    connection_generation=self.connection_generation,
+                    source_msg_type=msg_type,
+                    raw=msg,
                 )
                 self._check_missing_topology(ts, descr, berth, berth, msg)
             return
@@ -2286,6 +2486,20 @@ class Learner:
             ts,
             msg_type,
             self.connection_generation,
+        )
+
+        self.store.record_bridge_event(
+            area=self.area,
+            source_fingerprint=source_fingerprint,
+            event_type="STEP",
+            headcode=descr,
+            from_berth=from_berth,
+            to_berth=to_berth,
+            event_ts=ts,
+            received_ts=received_ts,
+            connection_generation=self.connection_generation,
+            source_msg_type=msg_type,
+            raw=msg,
         )
 
         self._check_missing_topology(ts, descr, from_berth, to_berth, msg)
@@ -3477,12 +3691,13 @@ class Listener(stomp.ConnectionListener if stomp is not None else object):
 
     def on_message(self, frame):
         self.messages += 1
+        received_at = time.time()
         headers = getattr(frame, "headers", {}) or {}
         ack_id = str(headers.get("ack") or headers.get("message-id") or "")
         try:
             messages = list(iter_message_objects(frame.body))
             for key, payload in messages:
-                self.learner.handle_message(key, payload)
+                self.learner.handle_message(key, payload, received_ts=received_at)
             if ack_id and self.connection is not None:
                 self.connection.ack(id=ack_id)
         except InvalidTDMessage as exc:
