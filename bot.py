@@ -24,6 +24,11 @@ from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 
+from nr_advanced.config import AdvancedConfig
+from nr_advanced.runtime import NetworkRuntime
+from nr_advanced.protocol import InvalidFeedMessage
+from nr_advanced.discord_commands import register as register_network_commands, network_alert_loop
+
 import t3_learner_clean as learner_mod
 from t3_snapshot_api import (
     BerthCatalogue,
@@ -249,6 +254,8 @@ def load_config() -> Config:
 
 
 CFG = load_config()
+ADVANCED_CONFIG = AdvancedConfig.from_env(CFG.learner_dir.parent, CFG.app_dir)
+ADVANCED = NetworkRuntime(ADVANCED_CONFIG) if ADVANCED_CONFIG.enabled else None
 
 # Evidence needed before the Discord bot turns pass-window statistics into a
 # user-facing signal-state interpretation.  One pass can produce many perfectly
@@ -1071,11 +1078,23 @@ class DiscordFeedListener:
 
     def on_message(self, frame: Any) -> None:
         received_at = time.time()
+        feed = "td"
+        if ADVANCED is not None:
+            feed = ADVANCED.feed_for_subscription(
+                str((getattr(frame, "headers", {}) or {}).get("subscription", "")),
+                self.subscription_id,
+            )
         with STATUS.lock:
             STATUS.nr_messages += 1
             STATUS.nr_last_message_ts = received_at
         ack_id = self._ack_id(frame)
         try:
+            if ADVANCED is not None:
+                ADVANCED.store.ingest(feed, frame.body, received_at)
+            if feed != "td":
+                if ack_id:
+                    self.connection.ack(id=ack_id)
+                return
             messages = list(learner_mod.iter_message_objects(frame.body))
             t3_count = sum(
                 1
@@ -1093,10 +1112,12 @@ class DiscordFeedListener:
             # therefore remain eligible for durable redelivery.
             if ack_id:
                 self.connection.ack(id=ack_id)
-        except learner_mod.InvalidTDMessage as exc:
+        except (learner_mod.InvalidTDMessage, InvalidFeedMessage) as exc:
             # A permanently malformed poison frame would otherwise block the
             # durable subscription forever. Record it, then consume it.
             self.learner.store.mark_invalid_message(self.learner.area, f"STOMP frame: {exc}")
+            if ADVANCED is not None:
+                ADVANCED.store.error(feed, str(exc))
             with STATUS.lock:
                 STATUS.nr_last_error = f"Malformed TD frame discarded: {exc}"
             if ack_id:
@@ -1105,6 +1126,9 @@ class DiscordFeedListener:
         except Exception:
             with STATUS.lock:
                 STATUS.nr_last_error = traceback.format_exc()
+            # No ACK: reconnect so a transient write failure is redelivered.
+            with contextlib.suppress(Exception):
+                self.connection.disconnect()
 
     def on_error(self, frame: Any) -> None:
         with STATUS.lock:
@@ -1112,6 +1136,8 @@ class DiscordFeedListener:
 
     def on_disconnected(self) -> None:
         self.learner.mark_feed_gap("STOMP disconnected; waiting for a new complete refresh")
+        if ADVANCED is not None:
+            ADVANCED.store.disconnected()
         with STATUS.lock:
             STATUS.nr_connected = False
             STATUS.nr_last_disconnect_ts = time.time()
@@ -1209,6 +1235,8 @@ class NRFeedService:
                     headers=connect_headers,
                 )
                 live_learner.mark_connected()
+                if ADVANCED is not None:
+                    ADVANCED.store.connected()
                 subscribe_headers = (
                     {"activemq.subscriptionName": CFG.nr_durable_name}
                     if CFG.nr_durable else {}
@@ -1219,6 +1247,12 @@ class NRFeedService:
                     ack="client-individual",
                     headers=subscribe_headers,
                 )
+                if ADVANCED is not None:
+                    for subscription_id, topic, headers in ADVANCED.subscriptions(
+                        CFG.nr_subscription_id, CFG.nr_durable_name, CFG.nr_durable
+                    ):
+                        conn.subscribe(destination=topic, id=subscription_id,
+                                       ack="client-individual", headers=headers)
 
                 connected_at = time.time()
                 delay = CFG.nr_reconnect_initial_seconds
@@ -1236,6 +1270,9 @@ class NRFeedService:
                     STATUS.nr_last_error = traceback.format_exc()
                     STATUS.nr_connected = False
             finally:
+                if ADVANCED is not None:
+                    with contextlib.suppress(Exception):
+                        ADVANCED.store.disconnected("feed stopped" if self.stop_event.is_set() else "connection ended")
                 with contextlib.suppress(Exception):
                     if live_learner is not None:
                         live_learner.mark_feed_gap(
@@ -1317,6 +1354,12 @@ if CFG.t3_api_enabled:
 
 class NRDiscordBot(commands.Bot):
     async def close(self) -> None:
+        if NETWORK_ALERT_TASK is not None:
+            NETWORK_ALERT_TASK.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await NETWORK_ALERT_TASK
+        if ADVANCED is not None:
+            await ADVANCED.stop()
         if T3_API_SERVICE is not None:
             await T3_API_SERVICE.stop()
         await asyncio.to_thread(NR_SERVICE.stop, join=True)
@@ -1350,16 +1393,19 @@ database_group = app_commands.Group(
     name="database",
     description="Database maintenance, import and export tools.",
 )
+network_group = app_commands.Group(name="network", description="Tyneside map, train tracking, delays and speed restrictions.")
+register_network_commands(network_group, ADVANCED)
 
 _COMMAND_GROUPS = (
-    feed_group, signal_group, td_group, raw_group, diagnostics_group, database_group
+    feed_group, signal_group, td_group, raw_group, diagnostics_group, database_group, network_group
 )
 _READY_DONE = False
+NETWORK_ALERT_TASK = None
 
 
 @bot.event
 async def on_ready() -> None:
-    global _READY_DONE
+    global _READY_DONE, NETWORK_ALERT_TASK
     ensure_dirs()
     if not _READY_DONE:
         if CFG.guild_id:
@@ -1373,6 +1419,12 @@ async def on_ready() -> None:
             NR_SERVICE.start()
         if T3_API_SERVICE is not None:
             await T3_API_SERVICE.start()
+        if ADVANCED is not None:
+            await ADVANCED.start(CFG.nr_username, CFG.nr_password)
+            if env_int("NR_ALERT_CHANNEL_ID", 0):
+                NETWORK_ALERT_TASK = asyncio.create_task(
+                    network_alert_loop(bot, ADVANCED, env_int("NR_ALERT_CHANNEL_ID", 0)), name="nr-network-alerts"
+                )
         _READY_DONE = True
 
     print(f"Logged in as {bot.user} | slash commands synced | uptime {uptime_text(STATUS.started_ts)}")
@@ -1510,6 +1562,14 @@ async def help_cmd(interaction: discord.Interaction) -> None:
             "The low-level raw tools are mainly for mapping and fault-finding."
         ),
         color=0x3498DB,
+    )
+    embed.add_field(
+        name="Network monitor",
+        value=("`/network map` — open the live Tyneside berth map\n"
+               "`/network status|berths|train` — wider TD coverage and TRUST reports\n"
+               "`/network delays|restrictions|schedules` — running-time evidence, TSRs and VSTP\n"
+               "`/network refresh` — reload CORPUS/SMART (Manage Server)"),
+        inline=False,
     )
     embed.add_field(
         name="Everyday",

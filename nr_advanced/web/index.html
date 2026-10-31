@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Tyneside · Signal Desk</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="masthead">
+    <a class="brand" href="/" aria-label="Tyneside Signal Desk home"><span class="brand-mark">↗</span><span>TYNESIDE<span class="brand-sub">SIGNAL DESK</span></span></a>
+    <div class="header-note">NETWORK RAIL DATA <span class="divider">/</span> LOCAL NETWORK MONITOR</div>
+    <div class="live-badge" id="connection">CONNECTING</div>
+    <button id="logout" class="quiet">Lock</button>
+  </header>
+  <div id="demo-banner" hidden>DEMONSTRATION · Synthetic trains and restrictions. This is not live railway data.</div>
+  <main>
+    <section class="intro">
+      <div><p class="eyebrow">MOVEMENTS / CONTEXT / EVIDENCE</p><h1>A clearer view of the network.</h1><p class="muted">Berth movements across Tyneside, with timings and restriction context.</p></div>
+      <div class="clock"><strong id="clock">—</strong><span>EUROPE / LONDON</span></div>
+    </section>
+    <section class="metrics" aria-label="Network summary">
+      <div><span class="metric-label">LIVE OCCUPATIONS</span><strong id="live-count">—</strong><small id="unconfirmed-count">Waiting for TD data</small></div>
+      <div><span class="metric-label">KNOWN BERTHS</span><strong id="berth-count">—</strong><small>Area-qualified descriptions</small></div>
+      <div><span class="metric-label">RUNNING-TIME FINDINGS</span><strong id="finding-count">—</strong><small>Observations in the last hour</small></div>
+      <div><span class="metric-label">LOCAL TSRs</span><strong id="restriction-count">—</strong><small>Applicable weekly snapshot</small></div>
+    </section>
+    <section class="workspace">
+      <div class="map-panel">
+        <div class="panel-title"><div><span class="eyebrow">01 / NETWORK</span><h2>Live berth diagram</h2></div><span class="subtle" id="updated">Waiting for first snapshot</span></div>
+        <div class="toolbar"><nav id="area-tabs" aria-label="TD area"></nav><div class="search-wrap"><label class="sr-only" for="search">Find a headcode, berth or place</label><input id="search" type="search" placeholder="Headcode, berth or place…" autocomplete="off"><div id="search-results" hidden></div></div></div>
+        <div class="map-meta"><span id="area-caption">Select an area to explore</span><label><input type="checkbox" id="occupied-only"> Occupied only</label></div>
+        <div class="map-stage">
+          <svg id="map" role="img" aria-label="Interactive schematic of TD berths. Use the search or arrow keys to navigate." tabindex="0" viewBox="0 0 1200 650">
+            <defs><pattern id="grid" width="30" height="30" patternUnits="userSpaceOnUse"><circle cx="1" cy="1" r="1" class="grid-dot"/></pattern></defs>
+            <rect id="grid-rect" x="-20000" y="-20000" width="40000" height="40000" fill="url(#grid)"/>
+            <g id="area-labels"></g><g id="edges"></g><g id="nodes"></g><g id="animations"></g>
+          </svg>
+          <div id="empty-map" hidden><strong>Waiting to discover this area</strong><p>Berths appear from live TD movements and SMART reference data. No layout has been invented.</p></div>
+          <div class="map-controls"><button id="zoom-in" aria-label="Zoom in">+</button><button id="zoom-out" aria-label="Zoom out">−</button><button id="fit">Fit</button></div>
+          <div class="map-watermark">SCHEMATIC · STEP TRANSITIONS · NO GPS</div>
+        </div>
+        <div class="legend"><span><i class="key occupied"></i>Live description</span><span><i class="key stale"></i>Unconfirmed</span><span><i class="key empty"></i>Empty / unknown</span><span><i class="line-key"></i>Observed step</span><span><i class="line-key dashed"></i>Reference link</span></div>
+        <p class="coverage" id="coverage">Coverage builds as data arrives.</p>
+        <div id="selection" class="selection"><span class="eyebrow">INSPECT A MOVEMENT</span><h3>Select a berth or train</h3><p class="muted">See its source, update time, movement trail and candidate TRUST reports.</p></div>
+      </div>
+      <aside>
+        <section class="side-card"><div class="side-heading"><span class="eyebrow">02 / RUNNING CONDITIONS</span><h2>What’s happening</h2></div><div id="findings"></div></section>
+        <section class="side-card"><div class="side-heading"><span class="eyebrow">03 / RESTRICTIONS</span><h2>TSR context</h2><p class="muted">Weekly publication. Emergency changes may be absent.</p></div><div id="restrictions"></div></section>
+      </aside>
+    </section>
+    <section class="feed-panel"><div class="panel-title"><div><span class="eyebrow">04 / DATA QUALITY</span><h2>Source health</h2></div><span class="subtle" id="baseline-count"></span></div><div id="feeds"></div></section>
+    <footer>Independent local monitor · Network Rail Open Data <span>Berth descriptions are observations, not proof of physical position or signal aspect.</span></footer>
+  </main>
+  <dialog id="login-dialog"><form id="login-form"><p class="eyebrow">TYNESIDE / SIGNAL DESK</p><h2>Open your network view</h2><p>Enter the map access key configured on your bot.</p><label for="token">Map access key</label><input id="token" type="password" autocomplete="current-password" required><p id="login-error" role="alert"></p><button type="submit" class="primary">Open Signal Desk →</button></form></dialog>
+</body>
+</html>

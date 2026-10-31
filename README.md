@@ -1,4 +1,62 @@
-# Metro T3 Network Rail Protocol Bot
+# Tyneside Network Rail Bot
+
+## October 2026: advanced network monitor
+
+The bot now includes a live browser berth diagram and multi-feed running-time
+analysis alongside the existing T3 signal learner and private Metro bridge.
+
+Start with **[ADVANCED_SETUP.md](ADVANCED_SETUP.md)** for the upgrade, NR account
+subscriptions, phone access, data limitations and the synthetic demonstration.
+
+New capabilities:
+
+- Area-qualified TD tracking for **T0, T1, T2 and T3** by default. Additional
+  two-character areas can be configured with `NR_AREAS`.
+- **TRUST** activations, movement reports, cancellations, reinstatements and
+  identity changes; dated train runs and correction-aware running-time analysis.
+- **TSR** weekly snapshots, including validity periods, separate current/future
+  WONs, passenger/freight limits and possible matches to affected locations.
+- **CORPUS and SMART** downloads on startup and daily, with last-good-data
+  retention on errors. SMART links are labelled as reporting references.
+- **VSTP** create/update/delete storage and UID lookup; optional JSON-lines
+  SCHEDULE import for ordinary timetable records.
+- A browser map with area filters, search, pan/zoom, discrete step animation,
+  source health, train history, restriction context and stale-state indicators.
+- `/network status`, `/network map`, `/network berths`, `/network train`,
+  `/network delays`, `/network restrictions`, `/network schedules`, and the
+  permission-checked `/network refresh` command.
+- Optional coalesced Discord alerts after repeated supported findings.
+
+For example, a TRUST departure/arrival pair that loses time between Sunderland
+and Newcastle can be matched against a currently applicable TSR at East Boldon.
+The result is a **possible contributor**, with its weekly publication and
+unverified line/mileage overlap disclosed. TD timing alone is not a measured
+speed, and matching a restriction does not prove delay causation.
+
+The map is a **schematic that grows with received data**, not a surveyed track
+plan. T3 starts with the supplied catalogue; other areas populate from SMART
+and actual CA steps. Conflicting supplied labels are highlighted. Unseen
+routes, cross-area handovers and Metro infrastructure outside the NR TD feed
+are not invented. The initial preset includes the adjoining T2 Darlington area;
+it does not imply every railway in the geographic region uses those four IDs.
+
+The new database is `NRBOT_DATA_DIR/network/network.sqlite`; the existing
+`t3_learner/td_signal_bit_learner.sqlite` and T3 bridge remain in place. See
+[docs/FEED_DESIGN.md](docs/FEED_DESIGN.md) for schema and matching decisions.
+See [docs/VALIDATION.md](docs/VALIDATION.md) for the 58 passing tests, browser
+checks and live deployment checks still required.
+
+Try the map without any credentials:
+
+```bash
+python network_monitor.py demo
+```
+
+Then open `http://127.0.0.1:8791` on that computer. The demo uses an isolated
+temporary database and an explicit synthetic-data banner. Production still
+starts with `python bot.py`.
+
+The sections below describe the preserved T3 learner and private bridge.
 
 ## Private T3 snapshot and event bridge
 
