@@ -1,0 +1,479 @@
+{
+  "description": "Schematic reference only. T3 berth IDs/descriptions originate from the supplied project. No geographic coordinates or cross-area physical links are invented.",
+  "aliases": {
+    "Sunderland": [
+      "SUN",
+      "SUNDRLD"
+    ],
+    "St Peter's": [
+      "MSP",
+      "St Peters"
+    ],
+    "Stadium of Light": [
+      "SFC"
+    ],
+    "Seaburn": [
+      "SBN"
+    ],
+    "East Boldon": [
+      "EBO",
+      "EBOLDON"
+    ],
+    "Brockley Whins": [
+      "BYW",
+      "BROCKLY"
+    ],
+    "Fellgate": [
+      "FGT"
+    ],
+    "Pelaw": [
+      "PLW",
+      "PJC",
+      "Pelaw Junction"
+    ],
+    "Heworth": [
+      "HTH",
+      "HEWORTH"
+    ],
+    "Gateshead": [
+      "Gateshead East",
+      "Gateshead West"
+    ],
+    "Newcastle": [
+      "Newcastle Central",
+      "NEWCASTLE"
+    ],
+    "Manors": [],
+    "Heaton": [],
+    "Benton": [],
+    "Northumberland Park": [],
+    "Backworth": [],
+    "Seaton Delaval": [],
+    "Newsham": [],
+    "Blyth Bebside": [],
+    "Bedlington": [],
+    "Ashington": [],
+    "Cramlington": [],
+    "Morpeth": [],
+    "Dunston": [],
+    "Metrocentre": [
+      "Metro Centre"
+    ],
+    "Blaydon": [],
+    "Wylam": [],
+    "Prudhoe": [],
+    "Stocksfield": [],
+    "Hexham": [],
+    "Chester-le-Street": [
+      "Chester Le Street"
+    ],
+    "Durham": [],
+    "Darlington": [],
+    "Park Lane": [],
+    "University": [],
+    "Millfield": [
+      "MLF"
+    ],
+    "Pallion": [
+      "PAL"
+    ],
+    "South Hylton": [
+      "SHL"
+    ],
+    "Hebburn": [
+      "HEB"
+    ],
+    "Jarrow": [
+      "JAR"
+    ],
+    "Tyne Dock": [
+      "Boldon North Junction"
+    ]
+  },
+  "corridors": [
+    {
+      "name": "Durham Coast to Newcastle",
+      "locations": [
+        "Sunderland",
+        "St Peter's",
+        "Stadium of Light",
+        "Seaburn",
+        "East Boldon",
+        "Brockley Whins",
+        "Fellgate",
+        "Pelaw",
+        "Heworth",
+        "Gateshead",
+        "Newcastle"
+      ]
+    },
+    {
+      "name": "Northumberland line",
+      "locations": [
+        "Newcastle",
+        "Manors",
+        "Heaton",
+        "Benton",
+        "Northumberland Park",
+        "Backworth",
+        "Seaton Delaval",
+        "Newsham",
+        "Blyth Bebside",
+        "Bedlington",
+        "Ashington"
+      ]
+    },
+    {
+      "name": "ECML north",
+      "locations": [
+        "Newcastle",
+        "Manors",
+        "Heaton",
+        "Benton",
+        "Cramlington",
+        "Morpeth"
+      ]
+    },
+    {
+      "name": "Tyne Valley",
+      "locations": [
+        "Newcastle",
+        "Gateshead",
+        "Dunston",
+        "Metrocentre",
+        "Blaydon",
+        "Wylam",
+        "Prudhoe",
+        "Stocksfield",
+        "Hexham"
+      ]
+    },
+    {
+      "name": "ECML south",
+      "locations": [
+        "Newcastle",
+        "Gateshead",
+        "Chester-le-Street",
+        "Durham",
+        "Darlington"
+      ]
+    },
+    {
+      "name": "South Hylton branch",
+      "locations": [
+        "Sunderland",
+        "Park Lane",
+        "University",
+        "Millfield",
+        "Pallion",
+        "South Hylton"
+      ]
+    }
+  ],
+  "layout": {
+    "T3:P751": [
+      100,
+      180
+    ],
+    "T3:P765": [
+      225,
+      180
+    ],
+    "T3:6282": [
+      350,
+      180
+    ],
+    "T3:6276": [
+      475,
+      180
+    ],
+    "T3:6274": [
+      600,
+      180
+    ],
+    "T3:6272": [
+      725,
+      180
+    ],
+    "T3:6268": [
+      850,
+      180
+    ],
+    "T3:6266": [
+      975,
+      180
+    ],
+    "T3:6264": [
+      1100,
+      180
+    ],
+    "T3:6254": [
+      1225,
+      180
+    ],
+    "T3:6252": [
+      1350,
+      180
+    ],
+    "T3:6248": [
+      1475,
+      180
+    ],
+    "T3:6246": [
+      1600,
+      180
+    ],
+    "T3:6242": [
+      1725,
+      180
+    ],
+    "T3:6238": [
+      1850,
+      180
+    ],
+    "T3:6236": [
+      1975,
+      180
+    ],
+    "T3:6234": [
+      2100,
+      180
+    ],
+    "T3:6232": [
+      2225,
+      180
+    ],
+    "T3:6228": [
+      2350,
+      180
+    ],
+    "T3:6226": [
+      2475,
+      180
+    ],
+    "T3:6224": [
+      2600,
+      180
+    ],
+    "T3:6222": [
+      2725,
+      180
+    ],
+    "T3:6208": [
+      2850,
+      180
+    ],
+    "T3:6206": [
+      2975,
+      180
+    ],
+    "T3:6298": [
+      3100,
+      180
+    ],
+    "T3:6294": [
+      3225,
+      180
+    ],
+    "T3:6292": [
+      3350,
+      180
+    ],
+    "T3:6290": [
+      3475,
+      180
+    ],
+    "T3:6288": [
+      3600,
+      180
+    ],
+    "T3:6286": [
+      3725,
+      180
+    ],
+    "T3:6284": [
+      3850,
+      180
+    ],
+    "T3:6280": [
+      3975,
+      180
+    ],
+    "T3:P764": [
+      100.0,
+      330
+    ],
+    "T3:6279": [
+      229.16666666666666,
+      330
+    ],
+    "T3:6277": [
+      358.3333333333333,
+      330
+    ],
+    "T3:6275": [
+      487.5,
+      330
+    ],
+    "T3:6273": [
+      616.6666666666666,
+      330
+    ],
+    "T3:6269": [
+      745.8333333333334,
+      330
+    ],
+    "T3:6267": [
+      875.0,
+      330
+    ],
+    "T3:6265": [
+      1004.1666666666666,
+      330
+    ],
+    "T3:6249": [
+      1133.3333333333333,
+      330
+    ],
+    "T3:6247": [
+      1262.5,
+      330
+    ],
+    "T3:6245": [
+      1391.6666666666667,
+      330
+    ],
+    "T3:6243": [
+      1520.8333333333333,
+      330
+    ],
+    "T3:6239": [
+      1650.0,
+      330
+    ],
+    "T3:6237": [
+      1779.1666666666667,
+      330
+    ],
+    "T3:6233": [
+      1908.3333333333333,
+      330
+    ],
+    "T3:6229": [
+      2037.5,
+      330
+    ],
+    "T3:6227": [
+      2166.6666666666665,
+      330
+    ],
+    "T3:6225": [
+      2295.8333333333335,
+      330
+    ],
+    "T3:6223": [
+      2425.0,
+      330
+    ],
+    "T3:6219": [
+      2554.1666666666665,
+      330
+    ],
+    "T3:6217": [
+      2683.3333333333335,
+      330
+    ],
+    "T3:6209": [
+      2812.5,
+      330
+    ],
+    "T3:6207": [
+      2941.6666666666665,
+      330
+    ],
+    "T3:6299": [
+      3070.8333333333335,
+      330
+    ],
+    "T3:6297": [
+      3200.0,
+      330
+    ],
+    "T3:6295": [
+      3329.1666666666665,
+      330
+    ],
+    "T3:6293": [
+      3458.3333333333335,
+      330
+    ],
+    "T3:6291": [
+      3587.5,
+      330
+    ],
+    "T3:6289": [
+      3716.6666666666665,
+      330
+    ],
+    "T3:6287": [
+      3845.8333333333335,
+      330
+    ],
+    "T3:6285": [
+      3975.0,
+      330
+    ],
+    "T3:P773": [
+      100,
+      500
+    ],
+    "T3:P775": [
+      225,
+      500
+    ],
+    "T3:P789": [
+      350,
+      500
+    ],
+    "T3:P803": [
+      475,
+      500
+    ],
+    "T3:P807": [
+      600,
+      500
+    ],
+    "T3:P770": [
+      100,
+      650
+    ],
+    "T3:P776": [
+      225,
+      650
+    ],
+    "T3:P790": [
+      350,
+      650
+    ],
+    "T3:P802": [
+      475,
+      650
+    ],
+    "T3:P804": [
+      600,
+      650
+    ],
+    "T3:6244": [
+      1660,
+      85
+    ],
+    "T3:APUP": [
+      -25,
+      180
+    ],
+    "T3:LSDP": [
+      -25,
+      330
+    ]
+  }
+}
